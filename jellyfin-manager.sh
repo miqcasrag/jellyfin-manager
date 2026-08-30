@@ -6,29 +6,14 @@ set -o pipefail
 # Jellyfin Manager
 # ============================================================
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JELLYFIN_DIR="$SCRIPT_DIR/jellyfin"
 BACKUP_DIR="$SCRIPT_DIR/backups"
 
 COMPOSE_FILE="$JELLYFIN_DIR/docker-compose.yml"
 ENV_FILE="$JELLYFIN_DIR/.env"
 
-CONTAINER_NAME="jellyfin"
-
-MEDIA_MOUNT="/mnt/jellyfin-media"
-
-# Hardware acceleration:
-# software
-# qsv
-# vaapi
-# nvidia
-HARDWARE_ACCELERATION="software"
-
-# Media disk information
-MEDIA_DEVICE=""
-MEDIA_UUID=""
-MEDIA_FSTYPE=""
-MEDIA_LABEL=""
+JELLYFIN_IMAGE="jellyfin/jellyfin:latest"
 
 # ============================================================
 # Colours
@@ -113,22 +98,20 @@ check_docker() {
 
         if docker info 2>&1 | grep -qi "permission denied"; then
 
-            error "Docker is installed, but this user can't talk to it."
+            error "Docker is installed, but this user cannot access it."
             echo
-            info "Fix it once:"
+            info "Run:"
             echo
             echo "  sudo usermod -aG docker \$USER"
             echo "  newgrp docker"
             echo
-            info "Or log out and log back in."
+            warning "You can also log out and log back in."
             echo
 
         else
 
-            error "The Docker daemon isn't running or isn't reachable."
-            echo
+            error "Docker daemon is not running or is not reachable."
             info "Try: sudo systemctl start docker"
-            echo
 
         fi
 
@@ -176,80 +159,47 @@ check_jellyfin() {
 
 install_dependencies() {
 
-    local missing=()
+    local missing=0
 
-    command -v git >/dev/null 2>&1 || missing+=("git")
-    command -v lsblk >/dev/null 2>&1 || missing+=("util-linux")
-    command -v findmnt >/dev/null 2>&1 || missing+=("util-linux")
-
-    if [[ ${#missing[@]} -eq 0 ]]; then
-        success "System dependencies ready."
-        return 0
+    if ! command -v git >/dev/null 2>&1; then
+        missing=1
     fi
 
-    info "Installing system dependencies..."
-
-    if command -v apt >/dev/null 2>&1; then
-
-        sudo apt update
-
-        sudo apt install -y \
-            git \
-            util-linux \
-            mount \
-            udisks2 \
-            exfatprogs
-
-    elif command -v dnf >/dev/null 2>&1; then
-
-        sudo dnf install -y \
-            git \
-            util-linux \
-            mount \
-            udisks2 \
-            exfatprogs
-
-    else
-
-        error "Unsupported package manager."
-        error "Please install git, util-linux and exfatprogs manually."
-
-        return 1
+    if ! command -v docker >/dev/null 2>&1; then
+        missing=1
     fi
-
-    success "System dependencies installed."
-}
-
-# ============================================================
-# Docker installation
-# ============================================================
-
-install_docker() {
 
     if command -v docker >/dev/null 2>&1 &&
-       docker compose version >/dev/null 2>&1; then
+       ! docker compose version >/dev/null 2>&1; then
+        missing=1
+    fi
 
-        success "Docker and Docker Compose are already installed."
+    if [[ "$missing" -eq 0 ]]; then
+        success "Dependencies ready."
         return 0
     fi
 
-    echo
-    info "Docker is required by Jellyfin Manager."
+    info "Installing dependencies..."
     echo
 
-    if ! confirm "Install Docker now?"; then
-        error "Docker is required."
+    if ! command -v apt >/dev/null 2>&1; then
+        error "This installer requires a Debian-based system with apt."
         return 1
     fi
 
-    if command -v apt >/dev/null 2>&1; then
+    sudo apt update
 
-        sudo apt update
+    if ! command -v git >/dev/null 2>&1; then
+        sudo apt install -y git
+    fi
+
+    if ! command -v docker >/dev/null 2>&1; then
+
+        info "Installing Docker..."
 
         sudo apt install -y \
             ca-certificates \
-            curl \
-            gnupg
+            curl
 
         sudo install \
             -m 0755 \
@@ -262,21 +212,13 @@ install_docker() {
                 https://download.docker.com/linux/debian/gpg \
                 -o /etc/apt/keyrings/docker.asc
 
-        fi
+            sudo chmod a+r \
+                /etc/apt/keyrings/docker.asc
 
-        sudo chmod a+r \
-            /etc/apt/keyrings/docker.asc
-
-        . /etc/os-release
-
-        local docker_repo_os="debian"
-
-        if [[ "$ID" == "ubuntu" ]]; then
-            docker_repo_os="ubuntu"
         fi
 
         echo \
-            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$docker_repo_os \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
             $(. /etc/os-release && echo "$VERSION_CODENAME") stable" |
             sudo tee /etc/apt/sources.list.d/docker.list \
             >/dev/null
@@ -290,41 +232,87 @@ install_docker() {
             docker-buildx-plugin \
             docker-compose-plugin
 
-    elif command -v dnf >/dev/null 2>&1; then
-
-        sudo dnf -y install \
-            dnf-plugins-core
-
-        sudo dnf-3 config-manager \
-            --add-repo \
-            https://download.docker.com/linux/fedora/docker-ce.repo
-
-        sudo dnf install -y \
-            docker-ce \
-            docker-ce-cli \
-            containerd.io \
-            docker-buildx-plugin \
-            docker-compose-plugin
-
         sudo systemctl enable --now docker
 
-    else
+        sudo usermod -aG docker "$USER"
 
-        error "Unsupported distribution."
+        warning "Your user was added to the docker group."
+        warning "Log out and back in, or run: newgrp docker"
+
+        if ! docker info >/dev/null 2>&1; then
+            echo
+            warning "Docker is installed, but the current shell cannot access it yet."
+            warning "Run this script again after reloading your session."
+            return 1
+        fi
+
+    fi
+
+    if ! docker compose version >/dev/null 2>&1; then
+
+        info "Installing Docker Compose..."
+
+        sudo apt install -y docker-compose-plugin
+
+    fi
+
+    if ! docker compose version >/dev/null 2>&1; then
+        error "Docker Compose installation failed."
         return 1
     fi
 
-    sudo systemctl enable --now docker
+    success "Dependencies ready."
 
-    sudo usermod -aG docker "$USER"
+    return 0
+}
 
-    echo
-    success "Docker installed."
-    warning "Your user was added to the docker group."
-    warning "Log out and back in before using Docker without sudo."
-    echo
+# ============================================================
+# Directory setup
+# ============================================================
 
-    return 1
+prepare_directories() {
+
+    mkdir -p \
+        "$JELLYFIN_DIR/config" \
+        "$JELLYFIN_DIR/cache" \
+        "$JELLYFIN_DIR/transcodes" \
+        "$BACKUP_DIR"
+
+    success "Jellyfin directories ready."
+}
+
+# ============================================================
+# Docker Compose
+# ============================================================
+
+create_compose_file() {
+
+    mkdir -p "$JELLYFIN_DIR"
+
+    cat > "$COMPOSE_FILE" << 'EOF'
+services:
+
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    restart: unless-stopped
+
+    ports:
+      - "8096:8096"
+      - "8920:8920"
+
+    environment:
+      - TZ=${TZ}
+
+    volumes:
+      - ./config:/config
+      - ./cache:/cache
+      - ./transcodes:/transcodes
+      - ${MEDIA_PATH}:/media:ro
+
+EOF
+
+    success "Docker Compose configuration created."
 }
 
 # ============================================================
@@ -346,11 +334,8 @@ get_timezone() {
 
     fi
 
-    if [[ -z "$timezone" ]] &&
-       [[ -f /etc/timezone ]]; then
-
+    if [[ -z "$timezone" ]] && [[ -f /etc/timezone ]]; then
         timezone="$(cat /etc/timezone)"
-
     fi
 
     [[ -z "$timezone" ]] && timezone="UTC"
@@ -358,25 +343,369 @@ get_timezone() {
     echo "$timezone"
 }
 
-# ============================================================
-# Media storage
-# ============================================================
+configure_timezone() {
 
-detect_media_partitions() {
+    local timezone
 
-    lsblk \
-        -rpo NAME,FSTYPE,LABEL,UUID,SIZE,MOUNTPOINTS \
-        2>/dev/null |
-    awk '
-        NR > 1 &&
-        $2 != "" &&
-        $4 != "" {
-            print
-        }
-    '
+    timezone="$(get_timezone)"
+
+    touch "$ENV_FILE"
+
+    if grep -q '^TZ=' "$ENV_FILE"; then
+
+        sed -i \
+            "s|^TZ=.*$|TZ=$timezone|" \
+            "$ENV_FILE"
+
+    else
+
+        echo "TZ=$timezone" >> "$ENV_FILE"
+
+    fi
+
+    success "Timezone: $timezone"
 }
 
-select_media_drive() {
+# ============================================================
+# Media Storage
+# ============================================================
+
+get_media_path() {
+
+    if [[ -f "$ENV_FILE" ]]; then
+
+        local path
+
+        path="$(
+            grep '^MEDIA_PATH=' "$ENV_FILE" |
+            head -n 1 |
+            cut -d '=' -f2-
+        )"
+
+        if [[ -n "$path" ]]; then
+            echo "$path"
+            return 0
+        fi
+
+    fi
+
+    echo ""
+}
+
+save_media_path() {
+
+    local path="$1"
+
+    touch "$ENV_FILE"
+
+    if grep -q '^MEDIA_PATH=' "$ENV_FILE"; then
+
+        sed -i \
+            "s|^MEDIA_PATH=.*$|MEDIA_PATH=$path|" \
+            "$ENV_FILE"
+
+    else
+
+        echo "MEDIA_PATH=$path" >> "$ENV_FILE"
+
+    fi
+}
+
+list_storage_devices() {
+
+    echo
+    echo "Available storage devices:"
+    echo
+
+    lsblk \
+        -o NAME,TYPE,FSTYPE,LABEL,UUID,SIZE,MOUNTPOINTS \
+        -e 7,11
+
+    echo
+}
+
+get_partition_uuid() {
+
+    local device="$1"
+
+    blkid -s UUID -o value "$device" 2>/dev/null
+}
+
+get_partition_label() {
+
+    local device="$1"
+
+    blkid -s LABEL -o value "$device" 2>/dev/null
+}
+
+get_mountpoint() {
+
+    local device="$1"
+
+    findmnt \
+        -n \
+        -o TARGET \
+        "$device" \
+        2>/dev/null |
+    head -n 1
+}
+
+select_storage_device() {
+
+    local devices=()
+    local device
+    local choice
+    local index
+
+    while IFS= read -r device; do
+        [[ -n "$device" ]] && devices+=("$device")
+    done < <(
+        lsblk \
+            -nrpo NAME,TYPE |
+        awk '$2 == "part" {print $1}'
+    )
+
+    if [[ ${#devices[@]} -eq 0 ]]; then
+
+        error "No partitions were found."
+        return 1
+
+    fi
+
+    echo
+    echo "Select the media partition:"
+    echo
+
+    local i=1
+
+    for device in "${devices[@]}"; do
+
+        local filesystem
+        local label
+        local uuid
+        local size
+        local mountpoint
+
+        filesystem="$(blkid -s TYPE -o value "$device" 2>/dev/null)"
+        label="$(get_partition_label "$device")"
+        uuid="$(get_partition_uuid "$device")"
+        size="$(lsblk -dnro SIZE "$device" 2>/dev/null)"
+        mountpoint="$(get_mountpoint "$device")"
+
+        printf "  %2d  %-18s %-8s %-20s %-38s %-12s" \
+            "$i" \
+            "$device" \
+            "${filesystem:-unknown}" \
+            "${label:-no-label}" \
+            "${uuid:-no-uuid}" \
+            "${size:-unknown}"
+
+        if [[ -n "$mountpoint" ]]; then
+            printf " %s" "$mountpoint"
+        fi
+
+        echo
+
+        i=$((i + 1))
+
+    done
+
+    echo
+    echo "  0  Back"
+    echo
+
+    read -r -p "Select partition: " choice
+
+    [[ "$choice" == "0" ]] && return 1
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+
+        error "Invalid selection."
+        return 1
+
+    fi
+
+    index=$((choice - 1))
+
+    if (( index < 0 || index >= ${#devices[@]} )); then
+
+        error "Invalid selection."
+        return 1
+
+    fi
+
+    SELECTED_DEVICE="${devices[$index]}"
+
+    return 0
+}
+
+create_mount_directory() {
+
+    local mountpoint="$1"
+
+    if [[ ! -d "$mountpoint" ]]; then
+
+        info "Creating mount point:"
+        echo "  $mountpoint"
+        echo
+
+        if ! sudo mkdir -p "$mountpoint"; then
+            error "Could not create mount point."
+            return 1
+        fi
+
+    fi
+
+    return 0
+}
+
+configure_fstab_mount() {
+
+    local device="$1"
+    local uuid
+    local filesystem
+    local label
+    local mountpoint
+
+    uuid="$(get_partition_uuid "$device")"
+    filesystem="$(blkid -s TYPE -o value "$device" 2>/dev/null)"
+    label="$(get_partition_label "$device")"
+
+    if [[ -z "$uuid" ]]; then
+
+        error "Could not determine partition UUID."
+        echo
+        info "Device: $device"
+        echo
+
+        blkid "$device" 2>/dev/null || true
+
+        return 1
+    fi
+
+    if [[ "$filesystem" != "exfat" &&
+          "$filesystem" != "ext4" &&
+          "$filesystem" != "ntfs" &&
+          "$filesystem" != "vfat" &&
+          "$filesystem" != "xfs" &&
+          "$filesystem" != "btrfs" ]]; then
+
+        warning "Filesystem detected: ${filesystem:-unknown}"
+        warning "This filesystem may require additional mount options."
+
+    fi
+
+    mountpoint="/mnt/jellyfin-media"
+
+    if [[ -n "$label" ]]; then
+
+        local safe_label
+
+        safe_label="$(
+            echo "$label" |
+            tr '[:space:]' '_' |
+            tr -cd '[:alnum:]_.-'
+        )"
+
+        if [[ -n "$safe_label" ]]; then
+            mountpoint="/mnt/$safe_label"
+        fi
+
+    fi
+
+    create_mount_directory "$mountpoint" || return 1
+
+    echo
+    info "Partition:"
+    echo "  Device:      $device"
+    echo "  Filesystem:  ${filesystem:-unknown}"
+    echo "  Label:       ${label:-none}"
+    echo "  UUID:        $uuid"
+    echo "  Mount point: $mountpoint"
+    echo
+
+    if ! confirm "Configure this partition to mount automatically?"; then
+        return 1
+    fi
+
+    local fstab_line
+
+    case "$filesystem" in
+
+        exfat)
+            fstab_line="UUID=$uuid $mountpoint exfat defaults,nofail,x-systemd.automount 0 0"
+            ;;
+
+        ntfs|ntfs3)
+            fstab_line="UUID=$uuid $mountpoint ntfs3 defaults,nofail,x-systemd.automount 0 0"
+            ;;
+
+        vfat)
+            fstab_line="UUID=$uuid $mountpoint vfat defaults,nofail,x-systemd.automount 0 0"
+            ;;
+
+        *)
+            fstab_line="UUID=$uuid $mountpoint $filesystem defaults,nofail,x-systemd.automount 0 0"
+            ;;
+
+    esac
+
+    echo
+    info "Adding mount to /etc/fstab..."
+
+    if grep -qE "^[[:space:]]*UUID=$uuid[[:space:]]" /etc/fstab 2>/dev/null; then
+
+        warning "An /etc/fstab entry for this UUID already exists."
+
+    else
+
+        echo "$fstab_line" |
+            sudo tee -a /etc/fstab >/dev/null
+
+        if [[ $? -ne 0 ]]; then
+
+            error "Could not update /etc/fstab."
+            return 1
+
+        fi
+
+        success "Automatic mount configured."
+
+    fi
+
+    if ! sudo mountpoint -q "$mountpoint"; then
+
+        info "Mounting media storage..."
+
+        if ! sudo mount "$mountpoint"; then
+
+            warning "Mount failed."
+            warning "The fstab entry was created, but the disk could not be mounted now."
+            return 1
+
+        fi
+
+    fi
+
+    if ! mountpoint -q "$mountpoint"; then
+
+        warning "Mount point is not active."
+        return 1
+
+    fi
+
+    success "Media storage mounted."
+    echo
+    echo "  $mountpoint"
+
+    save_media_path "$mountpoint"
+
+    success "Jellyfin media path saved."
+
+    return 0
+}
+
+media_storage_status() {
 
     header
 
@@ -384,278 +713,83 @@ select_media_drive() {
     echo "────────────────────────────────────────"
     echo
 
-    info "Available partitions:"
-    echo
+    local media_path
 
-    mapfile -t partitions < <(
-        detect_media_partitions
-    )
+    media_path="$(get_media_path)"
 
-    if [[ ${#partitions[@]} -eq 0 ]]; then
+    if [[ -z "$media_path" ]]; then
 
-        error "No partitions with a filesystem and UUID were found."
-        echo
-
-        pause
-        return 1
-    fi
-
-    local i=1
-    local line
-
-    for line in "${partitions[@]}"; do
-
-        local device
-        local fstype
-        local label
-        local uuid
-        local size
-        local mount
-
-        read -r \
-            device \
-            fstype \
-            label \
-            uuid \
-            size \
-            mount <<< "$line"
-
-        printf "  %2d) %-16s %-8s %-15s %-12s %s\n" \
-            "$i" \
-            "$device" \
-            "$fstype" \
-            "${label:--}" \
-            "$size" \
-            "$mount"
-
-        i=$((i + 1))
-    done
-
-    echo
-    echo "  0) Cancel"
-    echo
-
-    local choice
-
-    read -r -p "Select media partition: " choice
-
-    [[ "$choice" == "0" ]] && return 0
-
-    if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-
-        error "Invalid selection."
-        pause
-        return 1
-    fi
-
-    local index=$((choice - 1))
-
-    if (( index < 0 || index >= ${#partitions[@]} )); then
-
-        error "Invalid selection."
-        pause
-        return 1
-    fi
-
-    local selected="${partitions[$index]}"
-
-    read -r \
-        MEDIA_DEVICE \
-        MEDIA_FSTYPE \
-        MEDIA_LABEL \
-        MEDIA_UUID \
-        _ \
-        _ <<< "$selected"
-
-    echo
-
-    success "Selected:"
-    echo
-    echo "  Device : $MEDIA_DEVICE"
-    echo "  UUID   : $MEDIA_UUID"
-    echo "  Type   : $MEDIA_FSTYPE"
-    echo "  Label  : ${MEDIA_LABEL:--}"
-    echo
-
-    if [[ -z "$MEDIA_UUID" ]]; then
-
-        error "Could not determine partition UUID."
-        pause
-        return 1
-    fi
-
-    return 0
-}
-
-save_media_config() {
-
-    mkdir -p "$JELLYFIN_DIR"
-
-    cat > "$ENV_FILE" << EOF
-# Jellyfin Manager configuration
-
-MEDIA_MOUNT=$MEDIA_MOUNT
-MEDIA_DEVICE=$MEDIA_DEVICE
-MEDIA_UUID=$MEDIA_UUID
-MEDIA_FSTYPE=$MEDIA_FSTYPE
-MEDIA_LABEL=$MEDIA_LABEL
-HARDWARE_ACCELERATION=$HARDWARE_ACCELERATION
-EOF
-}
-
-load_media_config() {
-
-    if [[ -f "$ENV_FILE" ]]; then
-
-        # shellcheck disable=SC1090
-        source "$ENV_FILE"
-
-    fi
-
-    MEDIA_MOUNT="${MEDIA_MOUNT:-/mnt/jellyfin-media}"
-    HARDWARE_ACCELERATION="${HARDWARE_ACCELERATION:-software}"
-}
-
-configure_fstab() {
-
-    if [[ -z "$MEDIA_UUID" ]]; then
-        error "Media UUID is not configured."
-        return 1
-    fi
-
-    sudo mkdir -p "$MEDIA_MOUNT"
-
-    local options="defaults,nofail,x-systemd.automount,x-systemd.device-timeout=10s"
-
-    if [[ "$MEDIA_FSTYPE" == "exfat" ]]; then
-        options="defaults,nofail,x-systemd.automount,x-systemd.device-timeout=10s"
-    fi
-
-    local fstab_line
-
-    fstab_line="UUID=$MEDIA_UUID $MEDIA_MOUNT $MEDIA_FSTYPE $options 0 0"
-
-    sudo sed -i "\|[[:space:]]$MEDIA_MOUNT[[:space:]]|d" /etc/fstab
-
-    echo "$fstab_line" |
-        sudo tee -a /etc/fstab >/dev/null
-
-    sudo systemctl daemon-reload
-
-    success "Automatic media mounting configured."
-    echo
-    echo "  UUID       : $MEDIA_UUID"
-    echo "  Mount point: $MEDIA_MOUNT"
-    echo
-
-    return 0
-}
-
-mount_media() {
-
-    sudo mkdir -p "$MEDIA_MOUNT"
-
-    if mountpoint -q "$MEDIA_MOUNT"; then
-
-        success "Media drive is already mounted."
-        return 0
-    fi
-
-    info "Mounting media drive..."
-
-    if sudo mount "$MEDIA_MOUNT"; then
-
-        success "Media drive mounted."
-        return 0
-    fi
-
-    error "Failed to mount media drive."
-    return 1
-}
-
-unmount_media() {
-
-    if ! mountpoint -q "$MEDIA_MOUNT"; then
-
-        warning "Media drive is not mounted."
-        return 0
-    fi
-
-    info "Unmounting media drive..."
-
-    if sudo umount "$MEDIA_MOUNT"; then
-
-        success "Media drive unmounted."
-        return 0
-    fi
-
-    error "Failed to unmount media drive."
-    return 1
-}
-
-media_status() {
-
-    echo
-
-    if mountpoint -q "$MEDIA_MOUNT"; then
-
-        echo -e "Media Storage   ${GREEN}● MOUNTED${RESET}"
-
-        local device
-
-        device="$(
-            findmnt \
-                -n \
-                -o SOURCE \
-                --target "$MEDIA_MOUNT" \
-                2>/dev/null
-        )"
-
-        echo "  Mount point   : $MEDIA_MOUNT"
-        echo "  Device        : ${device:-unknown}"
+        warning "No media storage configured."
 
     else
 
-        echo -e "Media Storage   ${RED}● NOT MOUNTED${RESET}"
-        echo "  Mount point   : $MEDIA_MOUNT"
+        echo "Configured path:"
+        echo
+        echo "  $media_path"
+        echo
+
+        if mountpoint -q "$media_path"; then
+
+            success "Media storage is mounted."
+
+            echo
+
+            df -h "$media_path" 2>/dev/null || true
+
+        else
+
+            error "Media storage is NOT mounted."
+            warning "Jellyfin will not be able to access the media."
+
+        fi
 
     fi
+
+    echo
+    echo "Mounted filesystems:"
+    echo
+
+    findmnt \
+        -t ext4,exfat,ntfs,ntfs3,xfs,btrfs,vfat \
+        2>/dev/null |
+    head -n 30
+
+    pause
 }
 
 configure_media_storage() {
 
     header
 
-    load_media_config
-
     echo "Media Storage"
     echo "────────────────────────────────────────"
     echo
 
-    if [[ -n "$MEDIA_UUID" ]]; then
+    local current
 
-        echo "Current configuration:"
+    current="$(get_media_path)"
+
+    if [[ -n "$current" ]]; then
+
+        echo "Current media path:"
         echo
-        echo "  UUID        : $MEDIA_UUID"
-        echo "  Device      : ${MEDIA_DEVICE:-unknown}"
-        echo "  Filesystem  : ${MEDIA_FSTYPE:-unknown}"
-        echo "  Label       : ${MEDIA_LABEL:--}"
-        echo "  Mount point : $MEDIA_MOUNT"
+        echo "  $current"
         echo
 
-    else
+        if mountpoint -q "$current"; then
+            success "Currently mounted."
+        else
+            warning "Currently NOT mounted."
+        fi
 
-        warning "No media drive configured."
         echo
 
     fi
 
-    echo "  1) Select Media Drive"
-    echo "  2) Mount Media Drive"
-    echo "  3) Unmount Media Drive"
-    echo "  4) Media Status"
-    echo
-    echo "  0) Back"
+    echo "  1  Select storage partition"
+    echo "  2  Enter existing mount path"
+    echo "  3  Check storage status"
+    echo "  0  Back"
     echo
 
     local choice
@@ -666,18 +800,14 @@ configure_media_storage() {
 
         1)
 
-            if select_media_drive; then
+            list_storage_devices
+
+            if select_storage_device; then
 
                 echo
 
-                if configure_fstab; then
+                configure_fstab_mount "$SELECTED_DEVICE"
 
-                    save_media_config
-
-                    echo
-                    info "Media storage configuration saved."
-
-                fi
             fi
 
             pause
@@ -685,20 +815,34 @@ configure_media_storage() {
 
         2)
 
-            mount_media
+            echo
+            read -r -p "Enter media mount path: " path
+
+            if [[ -z "$path" ]]; then
+
+                error "Path cannot be empty."
+
+            elif [[ ! -d "$path" ]]; then
+
+                error "Directory does not exist."
+                echo
+                info "Create or mount the disk first."
+
+            else
+
+                save_media_path "$path"
+
+                success "Media path saved:"
+                echo "  $path"
+
+            fi
+
             pause
             ;;
 
         3)
 
-            unmount_media
-            pause
-            ;;
-
-        4)
-
-            media_status
-            pause
+            media_storage_status
             ;;
 
         0)
@@ -707,371 +851,176 @@ configure_media_storage() {
 
         *)
             error "Invalid selection."
-            sleep 1
+            pause
             ;;
 
     esac
 }
 
 # ============================================================
-# Hardware detection
+# Hardware Acceleration
 # ============================================================
 
-detect_intel_gpu() {
+get_hwaccel() {
 
-    command -v lspci >/dev/null 2>&1 || return 1
+    if [[ -f "$ENV_FILE" ]]; then
 
-    lspci 2>/dev/null |
-        grep -qiE 'VGA|3D|Display' &&
-    lspci 2>/dev/null |
-        grep -qi 'Intel'
-}
+        grep '^HW_ACCEL=' "$ENV_FILE" |
+            head -n 1 |
+            cut -d '=' -f2-
 
-detect_amd_gpu() {
-
-    command -v lspci >/dev/null 2>&1 || return 1
-
-    lspci 2>/dev/null |
-        grep -qiE 'VGA|3D|Display' &&
-    lspci 2>/dev/null |
-        grep -qiE 'AMD|ATI'
-}
-
-detect_nvidia_gpu() {
-
-    if command -v nvidia-smi >/dev/null 2>&1; then
-
-        nvidia-smi >/dev/null 2>&1
-        return $?
     fi
-
-    command -v lspci >/dev/null 2>&1 || return 1
-
-    lspci 2>/dev/null |
-        grep -qiE 'VGA|3D|Display' &&
-    lspci 2>/dev/null |
-        grep -qi 'NVIDIA'
 }
 
-check_dri() {
+save_hwaccel() {
 
-    [[ -d /dev/dri ]] || return 1
-    [[ -e /dev/dri/renderD128 ]]
-}
+    local value="$1"
 
-check_nvidia_runtime() {
+    touch "$ENV_FILE"
 
-    command -v nvidia-container-cli >/dev/null 2>&1 ||
-    command -v nvidia-ctk >/dev/null 2>&1
-}
+    if grep -q '^HW_ACCEL=' "$ENV_FILE"; then
 
-hardware_status() {
+        sed -i \
+            "s|^HW_ACCEL=.*$|HW_ACCEL=$value|" \
+            "$ENV_FILE"
 
-    echo
-    echo "Hardware Detection"
-    echo "────────────────────────────────────────"
-    echo
-
-    if detect_intel_gpu; then
-        echo -e "Intel GPU       ${GREEN}● DETECTED${RESET}"
     else
-        echo -e "Intel GPU       ${DIM}○ NOT DETECTED${RESET}"
+
+        echo "HW_ACCEL=$value" >> "$ENV_FILE"
+
+    fi
+}
+
+check_intel_gpu() {
+
+    [[ -e /dev/dri/renderD128 ]] ||
+    [[ -e /dev/dri/card0 ]]
+}
+
+check_amd_gpu() {
+
+    [[ -e /dev/dri/renderD128 ]] ||
+    [[ -e /dev/dri/card0 ]]
+}
+
+check_nvidia_gpu() {
+
+    command -v nvidia-smi >/dev/null 2>&1
+}
+
+hardware_acceleration_status() {
+
+    echo
+    echo "Hardware detection:"
+    echo
+
+    if check_intel_gpu; then
+        success "GPU device /dev/dri detected."
+    else
+        warning "No /dev/dri GPU device detected."
     fi
 
-    if detect_amd_gpu; then
-        echo -e "AMD GPU         ${GREEN}● DETECTED${RESET}"
-    else
-        echo -e "AMD GPU         ${DIM}○ NOT DETECTED${RESET}"
-    fi
+    if check_nvidia_gpu; then
 
-    if detect_nvidia_gpu; then
-        echo -e "NVIDIA GPU      ${GREEN}● DETECTED${RESET}"
+        success "NVIDIA GPU detected."
+
+        nvidia-smi \
+            --query-gpu=name,driver_version \
+            --format=csv,noheader \
+            2>/dev/null || true
+
     else
-        echo -e "NVIDIA GPU      ${DIM}○ NOT DETECTED${RESET}"
+
+        info "NVIDIA GPU not detected."
+
     fi
 
     echo
 
-    if check_dri; then
-        echo -e "/dev/dri        ${GREEN}● AVAILABLE${RESET}"
-    else
-        echo -e "/dev/dri        ${RED}● NOT AVAILABLE${RESET}"
-    fi
+    if [[ -e /dev/dri/renderD128 ]]; then
 
-    if check_nvidia_runtime; then
-        echo -e "NVIDIA Runtime  ${GREEN}● AVAILABLE${RESET}"
-    else
-        echo -e "NVIDIA Runtime  ${DIM}○ NOT AVAILABLE${RESET}"
+        info "Available DRM devices:"
+        ls -l /dev/dri 2>/dev/null
+
     fi
 
     echo
 }
 
-configure_hardware_acceleration() {
+create_hardware_compose_override() {
 
-    header
+    local hwaccel="$1"
+    local override="$JELLYFIN_DIR/docker-compose.override.yml"
 
-    load_media_config
+    rm -f "$override"
 
-    echo "Hardware Acceleration"
-    echo "────────────────────────────────────────"
-    echo
+    case "$hwaccel" in
 
-    case "$HARDWARE_ACCELERATION" in
-
-        software)
-            echo "Current: Software (CPU)"
-            ;;
-
-        qsv)
-            echo "Current: Intel Quick Sync"
-            ;;
-
-        vaapi)
-            echo "Current: AMD VA-API"
-            ;;
-
-        nvidia)
-            echo "Current: NVIDIA NVENC / NVDEC"
-            ;;
-
-        *)
-            echo "Current: Unknown"
-            ;;
-
-    esac
-
-    echo
-    echo "  1) Software (CPU)"
-    echo "  2) Auto Detect GPU"
-    echo "  3) Intel Quick Sync"
-    echo "  4) AMD VA-API"
-    echo "  5) NVIDIA NVENC / NVDEC"
-    echo
-    echo "  6) Check Hardware"
-    echo
-    echo "  0) Back"
-    echo
-
-    local choice
-
-    read -r -p "Select: " choice
-
-    case "$choice" in
-
-        1)
-
-            HARDWARE_ACCELERATION="software"
-
-            save_media_config
+        none)
 
             success "Hardware acceleration disabled."
             ;;
 
-        2)
+        qsv)
 
-            if detect_intel_gpu && check_dri; then
+            if [[ ! -d /dev/dri ]]; then
 
-                HARDWARE_ACCELERATION="qsv"
-                success "Intel Quick Sync detected."
-
-            elif detect_amd_gpu && check_dri; then
-
-                HARDWARE_ACCELERATION="vaapi"
-                success "AMD VA-API detected."
-
-            elif detect_nvidia_gpu &&
-                 check_nvidia_runtime; then
-
-                HARDWARE_ACCELERATION="nvidia"
-                success "NVIDIA acceleration detected."
-
-            else
-
-                HARDWARE_ACCELERATION="software"
-
-                warning "No supported GPU configuration was detected."
-                warning "Using software transcoding."
+                error "No /dev/dri device found."
+                warning "Intel Quick Sync requires a supported Intel GPU and /dev/dri."
+                return 1
 
             fi
 
-            save_media_config
-            ;;
-
-        3)
-
-            if ! detect_intel_gpu; then
-
-                warning "Intel GPU was not detected."
-                echo
-
-                if ! confirm "Enable Quick Sync anyway?"; then
-                    return
-                fi
-
-            fi
-
-            HARDWARE_ACCELERATION="qsv"
-
-            save_media_config
-
-            success "Intel Quick Sync selected."
-            ;;
-
-        4)
-
-            if ! detect_amd_gpu; then
-
-                warning "AMD GPU was not detected."
-                echo
-
-                if ! confirm "Enable AMD VA-API anyway?"; then
-                    return
-                fi
-
-            fi
-
-            HARDWARE_ACCELERATION="vaapi"
-
-            save_media_config
-
-            success "AMD VA-API selected."
-            ;;
-
-        5)
-
-            if ! detect_nvidia_gpu; then
-
-                warning "NVIDIA GPU was not detected."
-                echo
-
-                if ! confirm "Enable NVIDIA acceleration anyway?"; then
-                    return
-                fi
-
-            fi
-
-            HARDWARE_ACCELERATION="nvidia"
-
-            save_media_config
-
-            success "NVIDIA NVENC/NVDEC selected."
-            ;;
-
-        6)
-
-            hardware_status
-            pause
-            return
-            ;;
-
-        0)
-            return
-            ;;
-
-        *)
-            error "Invalid selection."
-            sleep 1
-            return
-            ;;
-
-    esac
-
-    echo
-    warning "Restart Jellyfin for the new hardware configuration to take effect."
-
-    pause
-}
-
-# ============================================================
-# Docker Compose generation
-# ============================================================
-
-generate_compose() {
-
-    load_media_config
-
-    mkdir -p "$JELLYFIN_DIR"
-
-    local timezone
-    timezone="$(get_timezone)"
-
-    case "$HARDWARE_ACCELERATION" in
-
-        software)
-
-            cat > "$COMPOSE_FILE" << EOF
+            cat > "$override" << 'EOF'
 services:
+
   jellyfin:
-    image: jellyfin/jellyfin:latest
-    container_name: $CONTAINER_NAME
-    restart: unless-stopped
-
-    environment:
-      - TZ=$timezone
-
-    ports:
-      - "8096:8096"
-      - "8920:8920"
-
-    volumes:
-      - ./config:/config
-      - ./cache:/cache
-      - $MEDIA_MOUNT:/media:ro
-EOF
-            ;;
-
-        qsv|vaapi)
-
-            cat > "$COMPOSE_FILE" << EOF
-services:
-  jellyfin:
-    image: jellyfin/jellyfin:latest
-    container_name: $CONTAINER_NAME
-    restart: unless-stopped
-
-    environment:
-      - TZ=$timezone
-
-    ports:
-      - "8096:8096"
-      - "8920:8920"
-
     devices:
       - /dev/dri:/dev/dri
-
-    volumes:
-      - ./config:/config
-      - ./cache:/cache
-      - $MEDIA_MOUNT:/media:ro
 EOF
+
+            success "Intel Quick Sync / VA-API device configured."
+            ;;
+
+        vaapi)
+
+            if [[ ! -d /dev/dri ]]; then
+
+                error "No /dev/dri device found."
+                warning "AMD VA-API requires /dev/dri."
+                return 1
+
+            fi
+
+            cat > "$override" << 'EOF'
+services:
+
+  jellyfin:
+    devices:
+      - /dev/dri:/dev/dri
+EOF
+
+            success "AMD VA-API device configured."
             ;;
 
         nvidia)
 
-            cat > "$COMPOSE_FILE" << EOF
+            if ! check_nvidia_gpu; then
+
+                error "nvidia-smi was not found."
+                warning "Install the NVIDIA driver and NVIDIA Container Toolkit first."
+                return 1
+
+            fi
+
+            cat > "$override" << 'EOF'
 services:
+
   jellyfin:
-    image: jellyfin/jellyfin:latest
-    container_name: $CONTAINER_NAME
-    restart: unless-stopped
-
-    environment:
-      - TZ=$timezone
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
-
-    ports:
-      - "8096:8096"
-      - "8920:8920"
-
     gpus: all
-
-    volumes:
-      - ./config:/config
-      - ./cache:/cache
-      - $MEDIA_MOUNT:/media:ro
 EOF
+
+            success "NVIDIA GPU configured."
             ;;
 
         *)
@@ -1082,9 +1031,126 @@ EOF
 
     esac
 
-    success "Docker Compose configuration generated."
-
     return 0
+}
+
+configure_hardware_acceleration() {
+
+    header
+
+    echo "Hardware Acceleration"
+    echo "────────────────────────────────────────"
+    echo
+
+    local current
+
+    current="$(get_hwaccel)"
+
+    if [[ -z "$current" ]]; then
+        current="none"
+    fi
+
+    echo "Current:"
+    echo
+
+    case "$current" in
+
+        qsv)
+            echo -e "  ${GREEN}Intel Quick Sync${RESET}"
+            ;;
+
+        vaapi)
+            echo -e "  ${GREEN}AMD VA-API${RESET}"
+            ;;
+
+        nvidia)
+            echo -e "  ${GREEN}NVIDIA NVENC/NVDEC${RESET}"
+            ;;
+
+        *)
+            echo -e "  ${DIM}Disabled${RESET}"
+            ;;
+
+    esac
+
+    echo
+
+    hardware_acceleration_status
+
+    echo
+    echo "Select hardware acceleration:"
+    echo
+    echo "  1  Disabled"
+    echo "  2  Intel Quick Sync"
+    echo "  3  AMD VA-API"
+    echo "  4  NVIDIA NVENC/NVDEC"
+    echo "  0  Back"
+    echo
+
+    local choice
+
+    read -r -p "Select: " choice
+
+    case "$choice" in
+
+        1)
+
+            save_hwaccel "none"
+            create_hardware_compose_override "none"
+
+            ;;
+
+        2)
+
+            if create_hardware_compose_override "qsv"; then
+                save_hwaccel "qsv"
+            fi
+
+            ;;
+
+        3)
+
+            if create_hardware_compose_override "vaapi"; then
+                save_hwaccel "vaapi"
+            fi
+
+            ;;
+
+        4)
+
+            if create_hardware_compose_override "nvidia"; then
+                save_hwaccel "nvidia"
+            fi
+
+            ;;
+
+        0)
+            return
+            ;;
+
+        *)
+
+            error "Invalid selection."
+
+            ;;
+
+    esac
+
+    echo
+
+    if [[ "$choice" != "0" ]]; then
+
+        info "Restart Jellyfin for the change to take effect."
+
+        if confirm "Restart Jellyfin now?"; then
+
+            restart_server
+
+        fi
+
+    fi
+
+    pause
 }
 
 # ============================================================
@@ -1097,16 +1163,14 @@ configuration_menu() {
 
         header
 
-        load_media_config
-
         echo "Configuration"
         echo "────────────────────────────────────────"
         echo
 
-        echo "  1) Media Storage"
-        echo "  2) Hardware Acceleration"
+        echo "  1  Media Storage"
+        echo "  2  Hardware Acceleration"
         echo
-        echo "  0) Back"
+        echo "  0  Back"
         echo
 
         local choice
@@ -1120,13 +1184,7 @@ configuration_menu() {
                 ;;
 
             2)
-
                 configure_hardware_acceleration
-
-                if check_jellyfin >/dev/null 2>&1; then
-                    generate_compose
-                fi
-
                 ;;
 
             0)
@@ -1144,10 +1202,10 @@ configuration_menu() {
 }
 
 # ============================================================
-# Start
+# Status
 # ============================================================
 
-start_jellyfin() {
+status_server() {
 
     header
 
@@ -1161,84 +1219,162 @@ start_jellyfin() {
         return
     }
 
-    load_media_config
+    echo "Jellyfin Status"
+    echo "────────────────────────────────────────"
+    echo
+
+    local status
+
+    status="$(
+        compose ps \
+            --format '{{.State}}|{{.Status}}' \
+            jellyfin 2>/dev/null |
+        head -n 1
+    )"
+
+    if [[ -z "$status" ]]; then
+
+        echo -e "Status      ${RED}● OFFLINE${RESET}"
+
+    elif echo "$status" | grep -q '^running|'; then
+
+        echo -e "Status      ${GREEN}● ONLINE${RESET}"
+
+    else
+
+        echo -e "Status      ${RED}● OFFLINE${RESET}"
+
+    fi
+
+    echo
+
+    local media_path
+
+    media_path="$(get_media_path)"
+
+    if [[ -n "$media_path" ]]; then
+
+        if mountpoint -q "$media_path"; then
+
+            echo -e "Media       ${GREEN}● MOUNTED${RESET}"
+            echo "Path        $media_path"
+
+        else
+
+            echo -e "Media       ${RED}● NOT MOUNTED${RESET}"
+            echo "Path        $media_path"
+
+        fi
+
+    else
+
+        echo -e "Media       ${YELLOW}● NOT CONFIGURED${RESET}"
+
+    fi
+
+    echo
+
+    local hw
+
+    hw="$(get_hwaccel)"
+
+    case "$hw" in
+
+        qsv)
+            echo "Hardware    Intel Quick Sync"
+            ;;
+
+        vaapi)
+            echo "Hardware    AMD VA-API"
+            ;;
+
+        nvidia)
+            echo "Hardware    NVIDIA NVENC/NVDEC"
+            ;;
+
+        *)
+            echo "Hardware    Disabled"
+            ;;
+
+    esac
+
+    echo
+
+    compose ps 2>/dev/null
+
+    pause
+}
+
+# ============================================================
+# Start
+# ============================================================
+
+start_server() {
+
+    header
+
+    check_jellyfin || {
+        pause
+        return
+    }
+
+    check_docker || {
+        pause
+        return
+    }
 
     echo "Start"
     echo "────────────────────────────────────────"
     echo
 
-    # --------------------------------------------------------
-    # Media drive
-    # --------------------------------------------------------
+    local media_path
 
-    if [[ -n "$MEDIA_UUID" ]]; then
+    media_path="$(get_media_path)"
 
-        info "Checking media storage..."
+    if [[ -z "$media_path" ]]; then
 
-        if ! mountpoint -q "$MEDIA_MOUNT"; then
+        warning "No media storage is configured."
+        echo
 
-            warning "Media drive is not currently mounted."
-            info "Attempting to mount it..."
+        if ! confirm "Start Jellyfin without a media directory?"; then
+            return
+        fi
 
-            if ! mount_media; then
+    else
 
-                error "Media drive could not be mounted."
-                echo
-                warning "Jellyfin will NOT be started."
-                pause
+        if ! mountpoint -q "$media_path"; then
+
+            error "Media storage is not mounted."
+            echo
+            echo "  $media_path"
+            echo
+
+            warning "Jellyfin may start, but the media libraries will be unavailable."
+            echo
+
+            if ! confirm "Start anyway?"; then
                 return
-
             fi
 
         else
 
-            success "Media storage is mounted."
+            success "Media storage mounted."
 
-        fi
-
-        echo
-
-    else
-
-        warning "No media storage has been configured."
-        echo
-        warning "Jellyfin will be started without the media drive."
-        echo
-
-        if ! confirm "Continue?"; then
-            return
         fi
 
     fi
 
-    # --------------------------------------------------------
-    # Generate compose
-    # --------------------------------------------------------
-
-    generate_compose || {
-        pause
-        return
-    }
-
     echo
-
-    # --------------------------------------------------------
-    # Start Jellyfin
-    # --------------------------------------------------------
 
     info "Starting Jellyfin..."
 
     if compose up -d; then
 
-        echo
         success "Jellyfin started."
 
     else
 
-        echo
         error "Failed to start Jellyfin."
-        pause
-        return
 
     fi
 
@@ -1249,7 +1385,7 @@ start_jellyfin() {
 # Stop
 # ============================================================
 
-stop_jellyfin() {
+stop_server() {
 
     header
 
@@ -1282,7 +1418,7 @@ stop_jellyfin() {
 # Restart
 # ============================================================
 
-restart_jellyfin() {
+restart_server() {
 
     header
 
@@ -1295,28 +1431,6 @@ restart_jellyfin() {
         pause
         return
     }
-
-    load_media_config
-
-    info "Checking media storage..."
-
-    if [[ -n "$MEDIA_UUID" ]] &&
-       ! mountpoint -q "$MEDIA_MOUNT"; then
-
-        info "Media drive is not mounted."
-        info "Attempting to mount it..."
-
-        if ! mount_media; then
-
-            error "Media drive could not be mounted."
-            pause
-            return
-
-        fi
-
-    fi
-
-    echo
 
     info "Restarting Jellyfin..."
 
@@ -1334,156 +1448,18 @@ restart_jellyfin() {
 }
 
 # ============================================================
-# Status
-# ============================================================
-
-status_jellyfin() {
-
-    header
-
-    load_media_config
-
-    echo "Status"
-    echo "────────────────────────────────────────"
-    echo
-
-    # --------------------------------------------------------
-    # Jellyfin
-    # --------------------------------------------------------
-
-    local container_status
-
-    container_status="$(
-        docker inspect \
-            --format '{{.State.Status}}' \
-            "$CONTAINER_NAME" \
-            2>/dev/null
-    )"
-
-    case "$container_status" in
-
-        running)
-            echo -e "Jellyfin        ${GREEN}● ONLINE${RESET}"
-            ;;
-
-        exited|dead)
-            echo -e "Jellyfin        ${RED}● OFFLINE${RESET}"
-            ;;
-
-        *)
-            echo -e "Jellyfin        ${DIM}○ NOT INSTALLED${RESET}"
-            ;;
-
-    esac
-
-    # --------------------------------------------------------
-    # Media
-    # --------------------------------------------------------
-
-    if mountpoint -q "$MEDIA_MOUNT"; then
-
-        echo -e "Media Storage   ${GREEN}● MOUNTED${RESET}"
-
-        local device
-
-        device="$(
-            findmnt \
-                -n \
-                -o SOURCE \
-                --target "$MEDIA_MOUNT" \
-                2>/dev/null
-        )"
-
-        echo "  Mount point   : $MEDIA_MOUNT"
-        echo "  Device        : ${device:-unknown}"
-
-    else
-
-        echo -e "Media Storage   ${RED}● NOT MOUNTED${RESET}"
-        echo "  Mount point   : $MEDIA_MOUNT"
-
-    fi
-
-    # --------------------------------------------------------
-    # Hardware
-    # --------------------------------------------------------
-
-    echo
-
-    case "$HARDWARE_ACCELERATION" in
-
-        software)
-            echo "Hardware        : Software (CPU)"
-            ;;
-
-        qsv)
-            echo "Hardware        : Intel Quick Sync"
-            ;;
-
-        vaapi)
-            echo "Hardware        : AMD VA-API"
-            ;;
-
-        nvidia)
-            echo "Hardware        : NVIDIA NVENC / NVDEC"
-            ;;
-
-        *)
-            echo "Hardware        : Not configured"
-            ;;
-
-    esac
-
-    # --------------------------------------------------------
-    # GPU device
-    # --------------------------------------------------------
-
-    if [[ "$HARDWARE_ACCELERATION" == "qsv" ||
-          "$HARDWARE_ACCELERATION" == "vaapi" ]]; then
-
-        if check_dri; then
-
-            echo -e "GPU Device      ${GREEN}● AVAILABLE${RESET}"
-
-        else
-
-            echo -e "GPU Device      ${RED}● NOT AVAILABLE${RESET}"
-
-        fi
-
-    elif [[ "$HARDWARE_ACCELERATION" == "nvidia" ]]; then
-
-        if command -v nvidia-smi >/dev/null 2>&1 &&
-           nvidia-smi >/dev/null 2>&1; then
-
-            echo -e "GPU Device      ${GREEN}● AVAILABLE${RESET}"
-
-        else
-
-            echo -e "GPU Device      ${RED}● NOT AVAILABLE${RESET}"
-
-        fi
-
-    else
-
-        echo -e "GPU Device      ${DIM}○ NOT REQUIRED${RESET}"
-
-    fi
-
-    echo
-
-    pause
-}
-
-# ============================================================
 # Logs
 # ============================================================
 
-logs_jellyfin() {
+logs_server() {
 
     check_jellyfin || return 1
+    check_docker || return 1
 
-    compose logs -f --tail=100
+    (
+        cd "$JELLYFIN_DIR" || exit 1
+        docker compose logs -f --tail=100 jellyfin
+    )
 }
 
 # ============================================================
@@ -1511,22 +1487,14 @@ backup_jellyfin() {
     info "Creating Jellyfin backup..."
     echo
 
-    info "Stopping Jellyfin temporarily..."
-
-    compose stop >/dev/null 2>&1
-
-    tar \
+    if tar \
         -czf "$backup_file" \
         -C "$JELLYFIN_DIR" \
-        config cache 2>/dev/null
-
-    local result=$?
-
-    compose start >/dev/null 2>&1
-
-    echo
-
-    if [[ "$result" -eq 0 ]]; then
+        config \
+        .env \
+        docker-compose.yml \
+        docker-compose.override.yml \
+        2>/dev/null; then
 
         success "Backup completed."
         echo
@@ -1534,377 +1502,37 @@ backup_jellyfin() {
 
     else
 
-        error "Backup failed."
-        rm -f "$backup_file"
-
-    fi
-
-    pause
-}
-
-# ============================================================
-# Restore
-# ============================================================
-
-restore_jellyfin() {
-
-    header
-
-    mkdir -p "$BACKUP_DIR"
-
-    mapfile -t backups < <(
-        find "$BACKUP_DIR" \
-            -maxdepth 1 \
-            -type f \
-            -name 'jellyfin-*.tar.gz' \
-            -printf '%f\n' |
-        sort -r
-    )
-
-    if [[ ${#backups[@]} -eq 0 ]]; then
-
-        error "No Jellyfin backups found."
-        pause
-        return
-
-    fi
-
-    echo "Restore"
-    echo "────────────────────────────────────────"
-    echo
-
-    local i=1
-    local backup
-
-    for backup in "${backups[@]}"; do
-
-        echo "  $i) $backup"
-
-        i=$((i + 1))
-    done
-
-    echo
-    echo "  0) Cancel"
-    echo
-
-    local choice
-
-    read -r -p "Select backup: " choice
-
-    [[ "$choice" == "0" ]] && return
-
-    if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-
-        error "Invalid selection."
-        pause
-        return
-
-    fi
-
-    local index=$((choice - 1))
-
-    if (( index < 0 || index >= ${#backups[@]} )); then
-
-        error "Invalid selection."
-        pause
-        return
-
-    fi
-
-    local selected="$BACKUP_DIR/${backups[$index]}"
-
-    echo
-    warning "This will replace the current Jellyfin configuration."
-    echo
-
-    if ! confirm "Continue?"; then
-        return
-    fi
-
-    check_docker || {
-        pause
-        return
-    }
-
-    if [[ -d "$JELLYFIN_DIR/config" ]]; then
-
-        mv \
-            "$JELLYFIN_DIR/config" \
-            "$JELLYFIN_DIR/config.before-restore-$(date +%s)"
-
-    fi
-
-    if [[ -d "$JELLYFIN_DIR/cache" ]]; then
-
-        mv \
-            "$JELLYFIN_DIR/cache" \
-            "$JELLYFIN_DIR/cache.before-restore-$(date +%s)"
-
-    fi
-
-    mkdir -p "$JELLYFIN_DIR"
-
-    info "Restoring backup..."
-
-    tar \
-        -xzf "$selected" \
-        -C "$JELLYFIN_DIR"
-
-    local result=$?
-
-    if [[ "$result" -eq 0 ]]; then
-
-        success "Restore completed."
-
-        info "Starting Jellyfin..."
-
-        compose up -d
-
-    else
-
-        error "Restore failed."
-
-    fi
-
-    pause
-}
-
-# ============================================================
-# Backup & Restore menu
-# ============================================================
-
-backup_menu() {
-
-    while true; do
-
-        header
-
-        echo "Backup & Restore"
-        echo "────────────────────────────────────────"
-        echo
-
-        echo "  1) Backup"
-        echo "  2) Restore"
-        echo
-        echo "  0) Back"
-        echo
-
-        local choice
-
-        read -r -p "Select: " choice
-
-        case "$choice" in
-
-            1)
-                backup_jellyfin
-                ;;
-
-            2)
-                restore_jellyfin
-                ;;
-
-            0)
-                return
-                ;;
-
-            *)
-                error "Invalid selection."
-                sleep 1
-                ;;
-
-        esac
-
-    done
-}
-
-# ============================================================
-# Install
-# ============================================================
-
-install_jellyfin() {
-
-    header
-
-    echo "Install"
-    echo "────────────────────────────────────────"
-    echo
-
-    if [[ -d "$JELLYFIN_DIR" ]]; then
-
-        warning "Jellyfin is already installed."
-        echo
-        echo "  $JELLYFIN_DIR"
-        echo
-
-        pause
-        return
-    fi
-
-    # --------------------------------------------------------
-    # Dependencies
-    # --------------------------------------------------------
-
-    if ! install_dependencies; then
-
-        pause
-        return
-
-    fi
-
-    echo
-
-    if ! install_docker; then
-
-        pause
-        return
-
-    fi
-
-    echo
-
-    if ! check_docker; then
-
-        pause
-        return
-
-    fi
-
-    # --------------------------------------------------------
-    # Directories
-    # --------------------------------------------------------
-
-    mkdir -p \
-        "$JELLYFIN_DIR/config" \
-        "$JELLYFIN_DIR/cache" \
-        "$BACKUP_DIR"
-
-    HARDWARE_ACCELERATION="software"
-
-    MEDIA_DEVICE=""
-    MEDIA_UUID=""
-    MEDIA_FSTYPE=""
-    MEDIA_LABEL=""
-
-    save_media_config
-
-    # --------------------------------------------------------
-    # Initial Compose
-    # --------------------------------------------------------
-
-    generate_compose
-
-    echo
-
-    success "Jellyfin configuration created."
-
-    # --------------------------------------------------------
-    # Media storage
-    # --------------------------------------------------------
-
-    echo
-    echo "Media Storage"
-    echo "────────────────────────────────────────"
-    echo
-
-    info "Jellyfin needs a mount point for your media disk."
-    info "The disk will be identified by UUID, so changing USB ports"
-    info "will not change the configured device."
-    echo
-
-    if confirm "Configure the media drive now?"; then
-
-        select_media_drive
-
-        if [[ -n "$MEDIA_UUID" ]]; then
-
+        warning "docker-compose.override.yml may not exist."
+        info "Retrying without override file..."
+
+        if tar \
+            -czf "$backup_file" \
+            -C "$JELLYFIN_DIR" \
+            config \
+            .env \
+            docker-compose.yml; then
+
+            success "Backup completed."
             echo
+            echo "  $backup_file"
 
-            configure_fstab
+        else
 
-            save_media_config
+            error "Backup failed."
+            rm -f "$backup_file"
 
         fi
 
-    else
-
-        warning "Media storage configuration skipped."
-
     fi
 
-    # --------------------------------------------------------
-    # Hardware acceleration
-    # --------------------------------------------------------
-
-    echo
-    echo "Hardware Acceleration"
-    echo "────────────────────────────────────────"
-    echo
-
-    info "Hardware acceleration is optional."
-    info "Software transcoding will be used by default."
-    echo
-
-    if confirm "Configure hardware acceleration now?"; then
-
-        configure_hardware_acceleration
-
-    fi
-
-    # --------------------------------------------------------
-    # Generate final Compose
-    # --------------------------------------------------------
-
-    load_media_config
-
-    generate_compose
-
-    echo
-
-    success "Jellyfin installation completed."
-
-    echo
-    echo "Jellyfin directory:"
-    echo "  $JELLYFIN_DIR"
-
-    echo
-    echo "Web interface:"
-    echo "  http://localhost:8096"
-
-    echo
-    info "Add Movies, TV Shows and other libraries from the"
-    info "Jellyfin web interface using:"
-    echo
-    echo "  /media"
-    echo
-
-    if [[ -n "$MEDIA_UUID" ]]; then
-
-        success "Media drive is configured using UUID."
-        info "The USB port can be changed without changing the configuration."
-
-    fi
-
-    echo
-
-    if confirm "Start Jellyfin now?"; then
-
-        start_jellyfin
-
-    else
-
-        info "Jellyfin remains OFFLINE."
-        info "Use Start from the main menu."
-
-        pause
-
-    fi
+    pause
 }
 
 # ============================================================
 # Update
 # ============================================================
 
-update_jellyfin() {
+update_server() {
 
     header
 
@@ -1922,17 +1550,11 @@ update_jellyfin() {
     echo "────────────────────────────────────────"
     echo
 
-    info "Pulling the latest Jellyfin image..."
-    echo
+    info "Pulling latest Jellyfin image..."
 
-    if compose pull; then
+    if ! compose pull jellyfin; then
 
-        echo
-        success "Jellyfin image updated."
-
-    else
-
-        error "Failed to pull the Jellyfin image."
+        error "Failed to download the latest Jellyfin image."
         pause
         return
 
@@ -1940,9 +1562,9 @@ update_jellyfin() {
 
     echo
 
-    info "Recreating Jellyfin container..."
+    info "Recreating Jellyfin..."
 
-    if compose up -d; then
+    if compose up -d jellyfin; then
 
         success "Jellyfin updated successfully."
 
@@ -1956,10 +1578,105 @@ update_jellyfin() {
 }
 
 # ============================================================
+# Install
+# ============================================================
+
+install_server() {
+
+    header
+
+    echo "Install"
+    echo "────────────────────────────────────────"
+    echo
+
+    if [[ -d "$JELLYFIN_DIR" ]]; then
+
+        warning "Jellyfin already exists."
+        echo
+        echo "  $JELLYFIN_DIR"
+
+        pause
+        return
+
+    fi
+
+    if ! install_dependencies; then
+
+        pause
+        return
+
+    fi
+
+    echo
+
+    mkdir -p "$JELLYFIN_DIR"
+
+    prepare_directories
+
+    configure_timezone
+
+    echo
+
+    info "Creating Docker Compose configuration..."
+
+    create_compose_file
+
+    echo
+
+    save_media_path "/mnt/jellyfin-media"
+
+    save_hwaccel "none"
+
+    create_hardware_compose_override "none"
+
+    echo
+
+    info "Pulling Jellyfin image..."
+
+    if ! compose pull; then
+
+        error "Failed to pull Jellyfin image."
+
+        pause
+        return
+
+    fi
+
+    echo
+
+    success "Jellyfin installation completed."
+
+    echo
+    echo "Jellyfin directory:"
+    echo
+    echo "  $JELLYFIN_DIR"
+    echo
+
+    info "Next steps:"
+    echo
+    echo "  1. Configure your media storage."
+    echo "  2. Configure hardware acceleration if desired."
+    echo "  3. Start Jellyfin."
+    echo "  4. Configure Movies and TV Shows from the Jellyfin interface."
+    echo
+
+    if confirm "Start Jellyfin now?"; then
+
+        start_server
+
+    else
+
+        info "Jellyfin remains OFFLINE."
+        pause
+
+    fi
+}
+
+# ============================================================
 # Uninstall
 # ============================================================
 
-uninstall_jellyfin() {
+uninstall_server() {
 
     header
 
@@ -1972,9 +1689,9 @@ uninstall_jellyfin() {
     echo "────────────────────────────────────────"
     echo
 
-    echo "  1) Remove Jellyfin"
-    echo "  2) Remove Jellyfin + configuration"
-    echo "  0) Cancel"
+    echo "  1  Remove Jellyfin"
+    echo "  2  Remove Jellyfin + configuration"
+    echo "  0  Cancel"
     echo
 
     local choice
@@ -1986,49 +1703,53 @@ uninstall_jellyfin() {
         1)
 
             echo
-            warning "The Jellyfin container will be removed."
-            warning "Configuration and media data will be preserved."
+            warning "Jellyfin containers and files will be removed."
+            echo
+            info "Configuration and media files will NOT be deleted."
             echo
 
             if ! confirm "Continue?"; then
                 return
             fi
 
-            compose down
+            compose down 2>/dev/null || true
 
-            success "Jellyfin container removed."
-            info "Configuration remains in:"
-            echo "  $JELLYFIN_DIR"
+            rm -rf -- \
+                "$JELLYFIN_DIR"
+
+            success "Jellyfin removed."
 
             ;;
 
         2)
 
             echo
-            warning "This will remove Jellyfin and its configuration."
-            warning "Your media files will NOT be deleted."
+            warning "This will remove Jellyfin, its configuration and cache."
+            warning "Your external media storage will NOT be deleted."
             echo
 
             if ! confirm "THIS CANNOT BE UNDONE. Continue?"; then
                 return
             fi
 
-            compose down
+            compose down 2>/dev/null || true
 
-            rm -rf \
+            rm -rf -- \
                 "$JELLYFIN_DIR"
 
             success "Jellyfin completely removed."
-            info "Your external media drive was not touched."
 
             ;;
 
         0)
+
             return
             ;;
 
         *)
+
             error "Invalid selection."
+
             ;;
 
     esac
@@ -2046,96 +1767,30 @@ main_menu() {
 
         header
 
-        load_media_config
-
-        # ----------------------------------------------------
-        # Jellyfin status
-        # ----------------------------------------------------
-
         if [[ -d "$JELLYFIN_DIR" ]] &&
            [[ -f "$COMPOSE_FILE" ]]; then
 
-            local container_status
+            if check_docker >/dev/null 2>&1 &&
+               compose ps \
+                    --status running \
+                    --services 2>/dev/null |
+               grep -qx "jellyfin"; then
 
-            container_status="$(
-                docker inspect \
-                    --format '{{.State.Status}}' \
-                    "$CONTAINER_NAME" \
-                    2>/dev/null
-            )"
+                echo -e "Jellyfin    ${GREEN}● ONLINE${RESET}"
 
-            case "$container_status" in
+            else
 
-                running)
-                    echo -e "Jellyfin        ${GREEN}● ONLINE${RESET}"
-                    ;;
+                echo -e "Jellyfin    ${RED}● OFFLINE${RESET}"
 
-                exited|dead)
-                    echo -e "Jellyfin        ${RED}● OFFLINE${RESET}"
-                    ;;
-
-                *)
-                    echo -e "Jellyfin        ${DIM}○ NOT RUNNING${RESET}"
-                    ;;
-
-            esac
+            fi
 
         else
 
-            echo -e "Jellyfin        ${DIM}○ NOT INSTALLED${RESET}"
+            echo -e "Jellyfin    ${DIM}○ NOT INSTALLED${RESET}"
 
         fi
 
-        # ----------------------------------------------------
-        # Media status
-        # ----------------------------------------------------
-
-        if mountpoint -q "$MEDIA_MOUNT"; then
-
-            echo -e "Media           ${GREEN}● MOUNTED${RESET}"
-
-        elif [[ -n "$MEDIA_UUID" ]]; then
-
-            echo -e "Media           ${RED}● NOT MOUNTED${RESET}"
-
-        else
-
-            echo -e "Media           ${DIM}○ NOT CONFIGURED${RESET}"
-
-        fi
-
-        # ----------------------------------------------------
-        # Hardware status
-        # ----------------------------------------------------
-
-        case "$HARDWARE_ACCELERATION" in
-
-            software)
-                echo "Hardware        : Software"
-                ;;
-
-            qsv)
-                echo "Hardware        : Intel Quick Sync"
-                ;;
-
-            vaapi)
-                echo "Hardware        : AMD VA-API"
-                ;;
-
-            nvidia)
-                echo "Hardware        : NVIDIA NVENC / NVDEC"
-                ;;
-
-            *)
-                echo "Hardware        : Not configured"
-                ;;
-
-        esac
-
         echo
-        echo "------------------------------------------------------------"
-        echo
-
         echo "  1  Start"
         echo "  2  Stop"
         echo "  3  Restart"
@@ -2143,76 +1798,73 @@ main_menu() {
         echo "  5  Logs"
 
         echo
-        echo "  6  Configuration"
-        echo "  7  Backup & Restore"
+        echo "  6  Backup"
 
         echo
-        echo "------------------------------------------------------------"
-        echo
+        echo "  7  Configuration"
 
+        echo
         echo "  8  Update"
-        echo "  9  Install Jellyfin"
-        echo " 10  Uninstall Jellyfin"
+        echo "  9  Install"
+        echo  " 10  Uninstall"
 
         echo
-        echo "------------------------------------------------------------"
-        echo
-
         echo "  0  Exit"
-        echo
 
-        local choice
+        echo
 
         read -r -p "Select: " choice
 
         case "$choice" in
 
             1)
-                start_jellyfin
+                start_server
                 ;;
 
             2)
-                stop_jellyfin
+                stop_server
                 ;;
 
             3)
-                restart_jellyfin
+                restart_server
                 ;;
 
             4)
-                status_jellyfin
+                status_server
                 ;;
 
             5)
-                logs_jellyfin
+                logs_server
                 ;;
 
             6)
-                configuration_menu
+                backup_jellyfin
                 ;;
 
             7)
-                backup_menu
+                configuration_menu
                 ;;
 
             8)
-                update_jellyfin
+                update_server
                 ;;
 
             9)
-                install_jellyfin
+                install_server
                 ;;
 
             10)
-                uninstall_jellyfin
+                uninstall_server
                 ;;
 
             0)
+
                 clear_screen
                 exit 0
                 ;;
 
             *)
+
                 error "Invalid selection."
                 sleep 1
                 ;;
@@ -2229,46 +1881,55 @@ main_menu() {
 case "${1:-}" in
 
     install)
-        install_jellyfin
+        install_server
         ;;
 
     uninstall)
-        uninstall_jellyfin
+        uninstall_server
         ;;
 
     start)
-        start_jellyfin
+        start_server
         ;;
 
     stop)
-        stop_jellyfin
+        stop_server
         ;;
 
     restart)
-        restart_jellyfin
+        restart_server
         ;;
 
     status)
-        status_jellyfin
+        status_server
         ;;
 
     logs)
-        logs_jellyfin
+        logs_server
         ;;
 
     backup)
         backup_jellyfin
         ;;
 
-    restore)
-        restore_jellyfin
+    update)
+        update_server
         ;;
 
-    update)
-        update_jellyfin
+    config)
+        configuration_menu
+        ;;
+
+    media)
+        configure_media_storage
+        ;;
+
+    hardware)
+        configure_hardware_acceleration
         ;;
 
     *)
+
         main_menu
         ;;
 
