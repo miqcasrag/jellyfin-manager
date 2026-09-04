@@ -891,21 +891,105 @@ save_hwaccel() {
     fi
 }
 
+get_render_node() {
+
+    local node
+
+    for node in /dev/dri/renderD1* /dev/dri/card*; do
+        [[ -e "$node" ]] && echo "$node" && return 0
+    done
+
+    return 1
+}
+
+get_gpu_vendor_id() {
+
+    # Reads the PCI vendor ID behind a /dev/dri node (e.g. 0x8086 = Intel,
+    # 0x1002/0x1022 = AMD, 0x10de = NVIDIA). This is what actually tells GPUs
+    # apart; the mere presence of /dev/dri does not.
+    local node="$1"
+    local name
+    local vendor_file
+
+    [[ -z "$node" ]] && return 1
+
+    name="$(basename "$node")"
+    vendor_file="/sys/class/drm/$name/device/vendor"
+
+    if [[ -r "$vendor_file" ]]; then
+        cat "$vendor_file" 2>/dev/null
+        return 0
+    fi
+
+    return 1
+}
+
 check_intel_gpu() {
 
-    [[ -e /dev/dri/renderD128 ]] ||
-    [[ -e /dev/dri/card0 ]]
+    local node vendor
+
+    node="$(get_render_node)" || return 1
+    vendor="$(get_gpu_vendor_id "$node")"
+
+    [[ "$vendor" == "0x8086" ]]
 }
 
 check_amd_gpu() {
 
-    [[ -e /dev/dri/renderD128 ]] ||
-    [[ -e /dev/dri/card0 ]]
+    local node vendor
+
+    node="$(get_render_node)" || return 1
+    vendor="$(get_gpu_vendor_id "$node")"
+
+    [[ "$vendor" == "0x1002" ]] || [[ "$vendor" == "0x1022" ]]
 }
 
 check_nvidia_gpu() {
 
-    command -v nvidia-smi >/dev/null 2>&1
+    command -v nvidia-smi >/dev/null 2>&1 &&
+    nvidia-smi >/dev/null 2>&1
+}
+
+get_render_group_gid() {
+
+    # The container needs to belong to whichever host group owns the render
+    # node, or it gets "Permission denied" against /dev/dri and Jellyfin
+    # silently falls back to software (libx264) transcoding.
+    local node="$1"
+    local gid
+
+    if [[ -n "$node" ]] && [[ -e "$node" ]]; then
+
+        gid="$(stat -c '%g' "$node" 2>/dev/null)"
+
+        if [[ -n "$gid" ]] && [[ "$gid" != "0" ]]; then
+            echo "$gid"
+            return 0
+        fi
+
+    fi
+
+    gid="$(getent group render 2>/dev/null | cut -d: -f3)"
+    [[ -n "$gid" ]] && echo "$gid" && return 0
+
+    gid="$(getent group video 2>/dev/null | cut -d: -f3)"
+    [[ -n "$gid" ]] && echo "$gid" && return 0
+
+    return 1
+}
+
+detect_hwaccel() {
+
+    # Best-effort automatic pick, in priority order.
+    if check_nvidia_gpu; then
+        echo "nvidia"
+    elif check_intel_gpu; then
+        echo "qsv"
+    elif check_amd_gpu; then
+        echo "vaapi"
+    else
+        echo "none"
+    fi
 }
 
 hardware_acceleration_status() {
@@ -914,10 +998,23 @@ hardware_acceleration_status() {
     echo "Hardware detection:"
     echo
 
-    if check_intel_gpu; then
-        success "GPU device /dev/dri detected."
+    local node
+    node="$(get_render_node)"
+
+    if [[ -n "$node" ]]; then
+
+        if check_intel_gpu; then
+            success "Intel GPU detected ($node) → Quick Sync (QSV)."
+        elif check_amd_gpu; then
+            success "AMD GPU detected ($node) → VA-API."
+        else
+            warning "GPU device found ($node) but vendor could not be identified."
+        fi
+
     else
+
         warning "No /dev/dri GPU device detected."
+
     fi
 
     if check_nvidia_gpu; then
@@ -937,10 +1034,19 @@ hardware_acceleration_status() {
 
     echo
 
-    if [[ -e /dev/dri/renderD128 ]]; then
+    if [[ -n "$node" ]]; then
 
         info "Available DRM devices:"
         ls -l /dev/dri 2>/dev/null
+
+        local gid
+        gid="$(get_render_group_gid "$node")"
+
+        if [[ -n "$gid" ]]; then
+            info "Render group GID on host: $gid (needed inside the container too)."
+        else
+            warning "Could not determine the render/video group GID."
+        fi
 
     fi
 
@@ -961,46 +1067,46 @@ create_hardware_compose_override() {
             success "Hardware acceleration disabled."
             ;;
 
-        qsv)
+        qsv|vaapi)
 
             if [[ ! -d /dev/dri ]]; then
 
                 error "No /dev/dri device found."
-                warning "Intel Quick Sync requires a supported Intel GPU and /dev/dri."
+                warning "Hardware transcoding requires a supported GPU and /dev/dri."
                 return 1
 
             fi
 
-            cat > "$override" << 'EOF'
-services:
+            local node gid
+            node="$(get_render_node)"
+            gid="$(get_render_group_gid "$node")"
 
-  jellyfin:
-    devices:
-      - /dev/dri:/dev/dri
-EOF
+            {
+                echo "services:"
+                echo
+                echo "  jellyfin:"
+                echo "    devices:"
+                echo "      - /dev/dri:/dev/dri"
 
-            success "Intel Quick Sync / VA-API device configured."
-            ;;
+                if [[ -n "$gid" ]]; then
+                    echo "    group_add:"
+                    echo "      - \"$gid\""
+                else
+                    warning "Could not detect the render group GID automatically."
+                    warning "If transcoding fails with a permission error, add it manually:"
+                    echo "  group_add: [\"<GID of getent group render>\"]"
+                fi
+            } > "$override"
 
-        vaapi)
-
-            if [[ ! -d /dev/dri ]]; then
-
-                error "No /dev/dri device found."
-                warning "AMD VA-API requires /dev/dri."
-                return 1
-
+            if [[ "$hwaccel" == "qsv" ]]; then
+                success "Intel Quick Sync (QSV) device + group configured."
+            else
+                success "AMD VA-API device + group configured."
             fi
 
-            cat > "$override" << 'EOF'
-services:
-
-  jellyfin:
-    devices:
-      - /dev/dri:/dev/dri
-EOF
-
-            success "AMD VA-API device configured."
+            warning "You still need to enable it in Jellyfin: Dashboard → Playback →"
+            warning "Hardware acceleration → pick this method, enable hardware"
+            warning "decoding/encoding, and disable both 'low-power' options."
             ;;
 
         nvidia)
@@ -1078,12 +1184,16 @@ configure_hardware_acceleration() {
     hardware_acceleration_status
 
     echo
+    local suggested
+    suggested="$(detect_hwaccel)"
+
     echo "Select hardware acceleration:"
     echo
     echo "  1  Disabled"
     echo "  2  Intel Quick Sync"
     echo "  3  AMD VA-API"
     echo "  4  NVIDIA NVENC/NVDEC"
+    echo -e "  5  Auto-detect ${DIM}(suggested: $suggested)${RESET}"
     echo "  0  Back"
     echo
 
@@ -1124,6 +1234,16 @@ configure_hardware_acceleration() {
 
             ;;
 
+        5)
+
+            info "Auto-detected: $suggested"
+
+            if create_hardware_compose_override "$suggested"; then
+                save_hwaccel "$suggested"
+            fi
+
+            ;;
+
         0)
             return
             ;;
@@ -1154,6 +1274,107 @@ configure_hardware_acceleration() {
 }
 
 # ============================================================
+# Hardware Acceleration Diagnostics
+# ============================================================
+
+diagnose_hardware_acceleration() {
+
+    header
+
+    echo "Hardware Acceleration Diagnostics"
+    echo "────────────────────────────────────────"
+    echo
+
+    check_jellyfin || {
+        pause
+        return
+    }
+
+    check_docker || {
+        pause
+        return
+    }
+
+    local node gid
+    node="$(get_render_node)"
+
+    if [[ -z "$node" ]]; then
+        error "No /dev/dri device on the host. Hardware transcoding is impossible."
+        pause
+        return
+    fi
+
+    success "Host render device: $node"
+    ls -l /dev/dri 2>/dev/null
+    echo
+
+    gid="$(get_render_group_gid "$node")"
+    [[ -n "$gid" ]] && info "Expected render/video group GID: $gid"
+
+    if ! compose ps --status running --services 2>/dev/null | grep -qx "jellyfin"; then
+
+        warning "Jellyfin container is not running, cannot check inside it."
+        pause
+        return
+
+    fi
+
+    echo
+    echo "Inside the container:"
+    echo
+
+    if compose exec -T jellyfin ls -l /dev/dri >/tmp/jf_dri_check 2>&1; then
+
+        cat /tmp/jf_dri_check
+        success "The container can see /dev/dri."
+
+    else
+
+        error "The container CANNOT access /dev/dri (permission denied or not passed through)."
+        cat /tmp/jf_dri_check 2>/dev/null
+
+    fi
+
+    rm -f /tmp/jf_dri_check
+
+    echo
+    info "Groups inside the container:"
+    compose exec -T jellyfin id 2>/dev/null || warning "Could not run 'id' inside the container."
+
+    echo
+    info "ffmpeg processes currently running inside the container (should normally be idle/empty):"
+    echo
+
+    if compose exec -T jellyfin sh -c "ps aux 2>/dev/null | grep '[f]fmpeg'" 2>/dev/null; then
+
+        warning "There is an active ffmpeg process. If this persists for a long time"
+        warning "with no one watching anything, it may be a stuck/looping transcode"
+        warning "(common when QSV/VAAPI fails and it keeps retrying) - this alone can"
+        warning "keep the CPU package power high even though the UI looks idle."
+
+    else
+
+        info "No ffmpeg process running right now."
+
+    fi
+
+    echo
+    info "Recent log lines mentioning hardware acceleration errors:"
+    echo
+
+    compose logs --tail=300 jellyfin 2>/dev/null |
+        grep -iE "vaapi|qsv|quick ?sync|hwaccel|va display|permission denied.*dri" |
+        tail -n 20 || true
+
+    echo
+    info "Reminder: passing the device is not enough. In Jellyfin's Dashboard →"
+    info "Playback, Hardware acceleration must be explicitly set to QSV/VA-API,"
+    info "with hardware decoding enabled and both low-power options disabled."
+
+    pause
+}
+
+# ============================================================
 # Configuration menu
 # ============================================================
 
@@ -1169,6 +1390,7 @@ configuration_menu() {
 
         echo "  1  Media Storage"
         echo "  2  Hardware Acceleration"
+        echo "  3  Hardware Acceleration Diagnostics"
         echo
         echo "  0  Back"
         echo
@@ -1185,6 +1407,10 @@ configuration_menu() {
 
             2)
                 configure_hardware_acceleration
+                ;;
+
+            3)
+                diagnose_hardware_acceleration
                 ;;
 
             0)
@@ -1625,9 +1851,17 @@ install_server() {
 
     save_media_path "/mnt/jellyfin-media"
 
-    save_hwaccel "none"
+    local detected_hwaccel
+    detected_hwaccel="$(detect_hwaccel)"
 
-    create_hardware_compose_override "none"
+    info "Auto-detected hardware acceleration: $detected_hwaccel"
+
+    if create_hardware_compose_override "$detected_hwaccel"; then
+        save_hwaccel "$detected_hwaccel"
+    else
+        save_hwaccel "none"
+        create_hardware_compose_override "none"
+    fi
 
     echo
 
@@ -1926,6 +2160,10 @@ case "${1:-}" in
 
     hardware)
         configure_hardware_acceleration
+        ;;
+
+    diagnose)
+        diagnose_hardware_acceleration
         ;;
 
     *)
