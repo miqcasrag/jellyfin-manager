@@ -427,15 +427,46 @@ list_storage_devices() {
 get_partition_uuid() {
 
     local device="$1"
+    local uuid
 
-    blkid -s UUID -o value "$device" 2>/dev/null
+    uuid="$(lsblk -dno UUID "$device" 2>/dev/null)"
+
+    if [[ -z "$uuid" ]]; then
+        # lsblk reads udev's cache and normally works without root; if it
+        # comes back empty, fall back to blkid, which needs to open the raw
+        # device and therefore needs root.
+        uuid="$(sudo blkid -s UUID -o value "$device" 2>/dev/null)"
+    fi
+
+    echo "$uuid"
 }
 
 get_partition_label() {
 
     local device="$1"
+    local label
 
-    blkid -s LABEL -o value "$device" 2>/dev/null
+    label="$(lsblk -dno LABEL "$device" 2>/dev/null)"
+
+    if [[ -z "$label" ]]; then
+        label="$(sudo blkid -s LABEL -o value "$device" 2>/dev/null)"
+    fi
+
+    echo "$label"
+}
+
+get_partition_fstype() {
+
+    local device="$1"
+    local fstype
+
+    fstype="$(lsblk -dno FSTYPE "$device" 2>/dev/null)"
+
+    if [[ -z "$fstype" ]]; then
+        fstype="$(sudo blkid -s TYPE -o value "$device" 2>/dev/null)"
+    fi
+
+    echo "$fstype"
 }
 
 get_mountpoint() {
@@ -450,6 +481,16 @@ get_mountpoint() {
     head -n 1
 }
 
+ensure_sudo_cached() {
+
+    if ! sudo -n true 2>/dev/null; then
+        info "Reading partition info requires root — you may be asked for your password."
+        sudo -v || return 1
+    fi
+
+    return 0
+}
+
 select_storage_device() {
 
     local devices=()
@@ -457,12 +498,31 @@ select_storage_device() {
     local choice
     local index
 
-    while IFS= read -r device; do
-        [[ -n "$device" ]] && devices+=("$device")
+    ensure_sudo_cached
+
+    declare -A p_uuid p_label p_fstype p_size p_mount
+
+    while IFS= read -r line; do
+
+        local NAME UUID LABEL FSTYPE SIZE MOUNTPOINT TYPE
+
+        eval "$line"
+
+        [[ "$TYPE" == "part" ]] || continue
+        [[ -n "$NAME" ]] || continue
+
+        devices+=("$NAME")
+        p_uuid["$NAME"]="$UUID"
+        p_label["$NAME"]="$LABEL"
+        p_fstype["$NAME"]="$FSTYPE"
+        p_size["$NAME"]="$SIZE"
+        p_mount["$NAME"]="$MOUNTPOINT"
+
     done < <(
         lsblk \
-            -nrpo NAME,TYPE |
-        awk '$2 == "part" {print $1}'
+            --paths \
+            --pairs \
+            -o NAME,TYPE,UUID,LABEL,FSTYPE,SIZE,MOUNTPOINT
     )
 
     if [[ ${#devices[@]} -eq 0 ]]; then
@@ -472,6 +532,25 @@ select_storage_device() {
 
     fi
 
+    # lsblk (udev cache) usually covers everything without root. Only the
+    # rare partition it can't resolve falls back to blkid — one shared sudo
+    # prompt above, instead of one per field per device.
+    for device in "${devices[@]}"; do
+
+        if [[ -z "${p_uuid[$device]}" ]]; then
+            p_uuid["$device"]="$(sudo blkid -s UUID -o value "$device" 2>/dev/null)"
+        fi
+
+        if [[ -z "${p_label[$device]}" ]]; then
+            p_label["$device"]="$(sudo blkid -s LABEL -o value "$device" 2>/dev/null)"
+        fi
+
+        if [[ -z "${p_fstype[$device]}" ]]; then
+            p_fstype["$device"]="$(sudo blkid -s TYPE -o value "$device" 2>/dev/null)"
+        fi
+
+    done
+
     echo
     echo "Select the media partition:"
     echo
@@ -480,28 +559,16 @@ select_storage_device() {
 
     for device in "${devices[@]}"; do
 
-        local filesystem
-        local label
-        local uuid
-        local size
-        local mountpoint
-
-        filesystem="$(blkid -s TYPE -o value "$device" 2>/dev/null)"
-        label="$(get_partition_label "$device")"
-        uuid="$(get_partition_uuid "$device")"
-        size="$(lsblk -dnro SIZE "$device" 2>/dev/null)"
-        mountpoint="$(get_mountpoint "$device")"
-
         printf "  %2d  %-18s %-8s %-20s %-38s %-12s" \
             "$i" \
             "$device" \
-            "${filesystem:-unknown}" \
-            "${label:-no-label}" \
-            "${uuid:-no-uuid}" \
-            "${size:-unknown}"
+            "${p_fstype[$device]:-unknown}" \
+            "${p_label[$device]:-no-label}" \
+            "${p_uuid[$device]:-no-uuid}" \
+            "${p_size[$device]:-unknown}"
 
-        if [[ -n "$mountpoint" ]]; then
-            printf " %s" "$mountpoint"
+        if [[ -n "${p_mount[$device]}" ]]; then
+            printf " %s" "${p_mount[$device]}"
         fi
 
         echo
@@ -568,7 +635,7 @@ configure_fstab_mount() {
     local mountpoint
 
     uuid="$(get_partition_uuid "$device")"
-    filesystem="$(blkid -s TYPE -o value "$device" 2>/dev/null)"
+    filesystem="$(get_partition_fstype "$device")"
     label="$(get_partition_label "$device")"
 
     if [[ -z "$uuid" ]]; then
@@ -578,7 +645,7 @@ configure_fstab_mount() {
         info "Device: $device"
         echo
 
-        blkid "$device" 2>/dev/null || true
+        sudo blkid "$device" 2>/dev/null || true
 
         return 1
     fi
