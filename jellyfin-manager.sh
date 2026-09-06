@@ -1390,30 +1390,47 @@ diagnose_hardware_acceleration() {
     echo "Inside the container:"
     echo
 
-    if compose exec -T jellyfin ls -l /dev/dri >/tmp/jf_dri_check 2>&1; then
+    local diag
+    diag="$(
+        compose exec -T jellyfin sh -c '
+            echo "---DRI---"
+            ls -l /dev/dri 2>&1
+            echo "---ID---"
+            id 2>&1
+            echo "---FFMPEG---"
+            ps aux 2>/dev/null | grep "[f]fmpeg"
+        ' 2>&1
+    )"
 
-        cat /tmp/jf_dri_check
-        success "The container can see /dev/dri."
+    local dri_block id_block ffmpeg_block
+
+    dri_block="$(sed -n '/^---DRI---$/,/^---ID---$/p' <<< "$diag" | sed '1d;$d')"
+    id_block="$(sed -n '/^---ID---$/,/^---FFMPEG---$/p' <<< "$diag" | sed '1d;$d')"
+    ffmpeg_block="$(sed -n '/^---FFMPEG---$/,$p' <<< "$diag" | sed '1d')"
+
+    if grep -qi "permission denied\|no such file" <<< "$dri_block"; then
+
+        error "The container CANNOT access /dev/dri (permission denied or not passed through)."
+        echo "$dri_block"
 
     else
 
-        error "The container CANNOT access /dev/dri (permission denied or not passed through)."
-        cat /tmp/jf_dri_check 2>/dev/null
+        echo "$dri_block"
+        success "The container can see /dev/dri."
 
     fi
 
-    rm -f /tmp/jf_dri_check
-
     echo
     info "Groups inside the container:"
-    compose exec -T jellyfin id 2>/dev/null || warning "Could not run 'id' inside the container."
+    echo "$id_block"
 
     echo
     info "ffmpeg processes currently running inside the container (should normally be idle/empty):"
     echo
 
-    if compose exec -T jellyfin sh -c "ps aux 2>/dev/null | grep '[f]fmpeg'" 2>/dev/null; then
+    if [[ -n "$ffmpeg_block" ]]; then
 
+        echo "$ffmpeg_block"
         warning "There is an active ffmpeg process. If this persists for a long time"
         warning "with no one watching anything, it may be a stuck/looping transcode"
         warning "(common when QSV/VAAPI fails and it keeps retrying) - this alone can"
@@ -2071,8 +2088,11 @@ main_menu() {
         if [[ -d "$JELLYFIN_DIR" ]] &&
            [[ -f "$COMPOSE_FILE" ]]; then
 
-            if check_docker >/dev/null 2>&1 &&
-               compose ps \
+            # A single `compose ps` call is enough: if the daemon is down or
+            # unreachable this just returns empty/fails, which already means
+            # OFFLINE. No need to also run `docker info` and `docker compose
+            # version` (via check_docker) on every single menu redraw.
+            if compose ps \
                     --status running \
                     --services 2>/dev/null |
                grep -qx "jellyfin"; then
