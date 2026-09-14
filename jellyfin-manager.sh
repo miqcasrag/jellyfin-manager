@@ -370,6 +370,39 @@ configure_timezone() {
 # Media Storage
 # ============================================================
 
+get_env_value() {
+
+    local key="$1"
+
+    if [[ -f "$ENV_FILE" ]]; then
+
+        grep "^${key}=" "$ENV_FILE" |
+        head -n 1 |
+        cut -d '=' -f2-
+
+    fi
+}
+
+save_env_value() {
+
+    local key="$1"
+    local value="$2"
+
+    touch "$ENV_FILE"
+
+    if grep -q "^${key}=" "$ENV_FILE"; then
+
+        sed -i \
+            "s|^${key}=.*\$|${key}=${value}|" \
+            "$ENV_FILE"
+
+    else
+
+        echo "${key}=${value}" >> "$ENV_FILE"
+
+    fi
+}
+
 get_media_path() {
 
     if [[ -f "$ENV_FILE" ]]; then
@@ -1459,6 +1492,382 @@ diagnose_hardware_acceleration() {
 }
 
 # ============================================================
+# Auto-Sleep (scale to zero, wake on connection)
+# ============================================================
+#
+# How it works:
+#   - jellyfin's own published port (8096) is taken over by a tiny socat
+#     listener. Jellyfin itself is remapped to 127.0.0.1:8097 (not reachable
+#     from outside directly).
+#   - On a new connection to 8096, socat execs wake-relay.sh: if the
+#     container is stopped, it starts it and waits until Jellyfin actually
+#     answers, THEN relays the connection through to 8097. The client just
+#     sees a slightly slower first load - no proxy/holding page needed.
+#   - A systemd timer runs idle-watch.sh every few minutes. It asks
+#     Jellyfin's own API (/Sessions) whether anything is actively playing,
+#     and only pauses the container after real idle time - never mid-playback,
+#     never just because a browser tab is open.
+
+WAKE_DIR="$JELLYFIN_DIR/wake"
+WAKE_PUBLIC_PORT=8096
+WAKE_INTERNAL_PORT=8097
+
+SYSTEMD_DIR="/etc/systemd/system"
+WAKE_PROXY_UNIT="jellyfin-wake-proxy.service"
+IDLE_WATCH_SERVICE_UNIT="jellyfin-idle-watch.service"
+IDLE_WATCH_TIMER_UNIT="jellyfin-idle-watch.timer"
+
+is_auto_sleep_enabled() {
+    [[ "$(get_env_value WAKE_ENABLED)" == "true" ]]
+}
+
+write_wake_scripts() {
+
+    mkdir -p "$WAKE_DIR"
+
+    cat > "$WAKE_DIR/wake-relay.sh" << EOF
+#!/usr/bin/env bash
+# Invoked per-connection by socat. stdin/stdout = the client socket.
+set -euo pipefail
+
+INTERNAL_PORT=$WAKE_INTERNAL_PORT
+COMPOSE_FILE="$COMPOSE_FILE"
+WAKE_DIR="$WAKE_DIR"
+
+is_paused() {
+    docker inspect -f '{{.State.Paused}}' jellyfin 2>/dev/null | grep -q true
+}
+
+is_running() {
+    docker inspect -f '{{.State.Running}}' jellyfin 2>/dev/null | grep -q true
+}
+
+if is_paused; then
+
+    # Common case: it was only asleep, not stopped — near-instant.
+    docker unpause jellyfin >>"\$WAKE_DIR/wake.log" 2>&1 || true
+    date +%s > "\$WAKE_DIR/last-wake.ts"
+    rm -f "\$WAKE_DIR/idle-since.ts"
+
+elif ! is_running; then
+
+    # Fully stopped for some other reason (manual stop, reboot, first run) —
+    # needs a real cold start and a health check.
+    docker compose -f "\$COMPOSE_FILE" start jellyfin >>"\$WAKE_DIR/wake.log" 2>&1 || true
+
+    date +%s > "\$WAKE_DIR/last-wake.ts"
+    rm -f "\$WAKE_DIR/idle-since.ts"
+
+    for _ in \$(seq 1 60); do
+        if curl -fsS "http://127.0.0.1:\$INTERNAL_PORT/health" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+
+fi
+
+exec socat - "TCP:127.0.0.1:\$INTERNAL_PORT"
+EOF
+
+    cat > "$WAKE_DIR/idle-watch.sh" << EOF
+#!/usr/bin/env bash
+# Run periodically by systemd. Pauses jellyfin only after real idle time,
+# checked against Jellyfin's own Sessions/ScheduledTasks API - never on raw
+# network traffic alone.
+set -euo pipefail
+
+INTERNAL_PORT=$WAKE_INTERNAL_PORT
+COMPOSE_FILE="$COMPOSE_FILE"
+ENV_FILE="$ENV_FILE"
+WAKE_DIR="$WAKE_DIR"
+
+is_paused() {
+    docker inspect -f '{{.State.Paused}}' jellyfin 2>/dev/null | grep -q true
+}
+
+is_running() {
+    docker inspect -f '{{.State.Running}}' jellyfin 2>/dev/null | grep -q true
+}
+
+# Already asleep, or not running at all for some other reason — nothing to
+# check. Querying a paused container's API would just hang.
+if is_paused; then
+    exit 0
+fi
+
+if ! is_running; then
+    exit 0
+fi
+
+api_key="\$(grep '^JELLYFIN_API_KEY=' "\$ENV_FILE" 2>/dev/null | cut -d= -f2- || true)"
+idle_min="\$(grep '^WAKE_IDLE_MIN=' "\$ENV_FILE" 2>/dev/null | cut -d= -f2- || true)"
+idle_min="\${idle_min:-30}"
+
+if [[ -z "\$api_key" ]]; then
+    exit 0
+fi
+
+# Grace period right after waking up, so a slow-starting client isn't
+# mistaken for "nobody's here yet".
+if [[ -f "\$WAKE_DIR/last-wake.ts" ]]; then
+    last_wake="\$(cat "\$WAKE_DIR/last-wake.ts")"
+    now="\$(date +%s)"
+    if (( now - last_wake < 300 )); then
+        exit 0
+    fi
+fi
+
+sessions_json="\$(curl -fsS "http://127.0.0.1:\$INTERNAL_PORT/Sessions?api_key=\$api_key" 2>/dev/null)" || exit 0
+
+if command -v jq >/dev/null 2>&1; then
+    playing_count="\$(echo "\$sessions_json" | jq '[.[] | select(.NowPlayingItem != null)] | length' 2>/dev/null || true)"
+else
+    playing_count="\$(echo "\$sessions_json" | { grep -o '"NowPlayingItem":{' || true; } | wc -l)"
+fi
+
+if [[ "\${playing_count:-0}" -gt 0 ]]; then
+    rm -f "\$WAKE_DIR/idle-since.ts"
+    exit 0
+fi
+
+# Don't stop mid-scan (library scan, metadata refresh, etc.)
+tasks_json="\$(curl -fsS "http://127.0.0.1:\$INTERNAL_PORT/ScheduledTasks?api_key=\$api_key" 2>/dev/null)" || true
+
+if echo "\$tasks_json" | grep -q '"State":"Running"'; then
+    exit 0
+fi
+
+if [[ ! -f "\$WAKE_DIR/idle-since.ts" ]]; then
+    date +%s > "\$WAKE_DIR/idle-since.ts"
+    exit 0
+fi
+
+idle_since="\$(cat "\$WAKE_DIR/idle-since.ts")"
+now="\$(date +%s)"
+idle_elapsed_min=\$(( (now - idle_since) / 60 ))
+
+if (( idle_elapsed_min >= idle_min )); then
+    docker pause jellyfin
+    rm -f "\$WAKE_DIR/idle-since.ts"
+fi
+EOF
+
+    chmod +x "$WAKE_DIR/wake-relay.sh" "$WAKE_DIR/idle-watch.sh"
+}
+
+write_systemd_units() {
+
+    sudo tee "$SYSTEMD_DIR/$WAKE_PROXY_UNIT" > /dev/null << EOF
+[Unit]
+Description=Jellyfin wake-on-connect proxy
+After=docker.service
+Requires=docker.service
+
+[Service]
+ExecStart=/usr/bin/socat TCP-LISTEN:$WAKE_PUBLIC_PORT,reuseaddr,fork EXEC:$WAKE_DIR/wake-relay.sh
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo tee "$SYSTEMD_DIR/$IDLE_WATCH_SERVICE_UNIT" > /dev/null << EOF
+[Unit]
+Description=Jellyfin idle watcher (pauses the container after real idle time)
+
+[Service]
+Type=oneshot
+ExecStart=$WAKE_DIR/idle-watch.sh
+EOF
+
+    sudo tee "$SYSTEMD_DIR/$IDLE_WATCH_TIMER_UNIT" > /dev/null << EOF
+[Unit]
+Description=Run the Jellyfin idle watcher periodically
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    sudo systemctl daemon-reload
+}
+
+remove_systemd_units() {
+
+    sudo systemctl disable --now \
+        "$WAKE_PROXY_UNIT" \
+        "$IDLE_WATCH_TIMER_UNIT" \
+        "$IDLE_WATCH_SERVICE_UNIT" \
+        2>/dev/null || true
+
+    sudo rm -f \
+        "$SYSTEMD_DIR/$WAKE_PROXY_UNIT" \
+        "$SYSTEMD_DIR/$IDLE_WATCH_SERVICE_UNIT" \
+        "$SYSTEMD_DIR/$IDLE_WATCH_TIMER_UNIT"
+
+    sudo systemctl daemon-reload
+}
+
+set_compose_port_mapping() {
+
+    # $1: "wake" -> internal-only mapping used while auto-sleep is active
+    #     "direct" -> the original, directly-published mapping
+    local mode="$1"
+
+    if [[ "$mode" == "wake" ]]; then
+
+        sed -i \
+            "s|- \"$WAKE_PUBLIC_PORT:8096\"|- \"127.0.0.1:$WAKE_INTERNAL_PORT:8096\"|" \
+            "$COMPOSE_FILE"
+
+    else
+
+        sed -i \
+            "s|- \"127.0.0.1:$WAKE_INTERNAL_PORT:8096\"|- \"$WAKE_PUBLIC_PORT:8096\"|" \
+            "$COMPOSE_FILE"
+
+    fi
+}
+
+configure_auto_sleep() {
+
+    header
+    echo "Auto-Sleep (scale to zero)"
+    echo "────────────────────────────────────────"
+    echo
+
+    check_jellyfin || { pause; return; }
+    check_docker || { pause; return; }
+    ensure_sudo_cached || { pause; return; }
+
+    if ! command -v socat >/dev/null 2>&1; then
+
+        info "Installing socat..."
+        sudo apt-get update -qq && sudo apt-get install -y socat
+
+    fi
+
+    warning "This moves Jellyfin's port ($WAKE_PUBLIC_PORT) behind a wake proxy."
+    warning "Access stays on the same port — only the first request after an"
+    warning "idle period will take a few extra seconds while it wakes up."
+    echo
+    warning "You need a Jellyfin API key for real idle detection (Dashboard →"
+    warning "Advanced → API Keys → create one, any name). Without it, the"
+    warning "container will never be auto-paused, to be safe."
+    echo
+
+    local api_key idle_min
+
+    read -r -p "Jellyfin API key: " api_key
+    read -r -p "Idle timeout in minutes before sleeping [30]: " idle_min
+    idle_min="${idle_min:-30}"
+
+    if [[ -z "$api_key" ]]; then
+        error "No API key provided — aborting."
+        pause
+        return
+    fi
+
+    save_env_value "JELLYFIN_API_KEY" "$api_key"
+    save_env_value "WAKE_IDLE_MIN" "$idle_min"
+
+    write_wake_scripts
+    set_compose_port_mapping "wake"
+    write_systemd_units
+
+    if ! compose up -d; then
+        error "Failed to recreate the jellyfin container with the new port mapping."
+        pause
+        return
+    fi
+
+    sudo systemctl enable --now "$WAKE_PROXY_UNIT"
+    sudo systemctl enable --now "$IDLE_WATCH_TIMER_UNIT"
+
+    save_env_value "WAKE_ENABLED" "true"
+
+    success "Auto-sleep is active."
+    info "Jellyfin will sleep after $idle_min min with no active playback,"
+    info "and wake automatically on the next connection to port $WAKE_PUBLIC_PORT."
+
+    pause
+}
+
+disable_auto_sleep() {
+
+    header
+    echo "Disable Auto-Sleep"
+    echo "────────────────────────────────────────"
+    echo
+
+    check_jellyfin || { pause; return; }
+    ensure_sudo_cached || { pause; return; }
+
+    if docker inspect -f '{{.State.Paused}}' jellyfin 2>/dev/null | grep -q true; then
+        info "Jellyfin is currently asleep — waking it up before disabling."
+        docker unpause jellyfin 2>/dev/null || true
+    fi
+
+    remove_systemd_units
+    set_compose_port_mapping "direct"
+    save_env_value "WAKE_ENABLED" "false"
+
+    if ! compose up -d; then
+        error "Port reverted, but failed to recreate the jellyfin container."
+        warning "Run 'docker compose up -d' manually inside $JELLYFIN_DIR."
+    else
+        success "Auto-sleep disabled. Jellyfin is directly reachable on port $WAKE_PUBLIC_PORT again."
+    fi
+
+    pause
+}
+
+auto_sleep_status() {
+
+    header
+    echo "Auto-Sleep Status"
+    echo "────────────────────────────────────────"
+    echo
+
+    if is_auto_sleep_enabled; then
+
+        success "Auto-sleep: ENABLED"
+        info "Idle timeout: $(get_env_value WAKE_IDLE_MIN) minutes"
+
+        if docker inspect -f '{{.State.Paused}}' jellyfin 2>/dev/null | grep -q true; then
+            warning "Jellyfin container: asleep (paused) — will wake instantly on next connection"
+        elif docker inspect -f '{{.State.Running}}' jellyfin 2>/dev/null | grep -q true; then
+            success "Jellyfin container: running"
+        else
+            warning "Jellyfin container: stopped — next connection will need a full cold start"
+        fi
+
+        if [[ -f "$WAKE_DIR/idle-since.ts" ]]; then
+            local idle_since now
+            idle_since="$(cat "$WAKE_DIR/idle-since.ts")"
+            now="$(date +%s)"
+            info "Idle for $(( (now - idle_since) / 60 )) minute(s) so far."
+        fi
+
+        echo
+        info "systemd units:"
+        systemctl is-active "$WAKE_PROXY_UNIT" 2>/dev/null
+        systemctl is-active "$IDLE_WATCH_TIMER_UNIT" 2>/dev/null
+
+    else
+
+        info "Auto-sleep is not enabled."
+
+    fi
+
+    pause
+}
+
+# ============================================================
 # Configuration menu
 # ============================================================
 
@@ -1475,6 +1884,13 @@ configuration_menu() {
         echo "  1  Media Storage"
         echo "  2  Hardware Acceleration"
         echo "  3  Hardware Acceleration Diagnostics"
+
+        if is_auto_sleep_enabled; then
+            echo -e "  4  Auto-Sleep ${GREEN}(enabled)${RESET} — status / disable"
+        else
+            echo "  4  Auto-Sleep (scale to zero) — enable"
+        fi
+
         echo
         echo "  0  Back"
         echo
@@ -1495,6 +1911,24 @@ configuration_menu() {
 
             3)
                 diagnose_hardware_acceleration
+                ;;
+
+            4)
+
+                if is_auto_sleep_enabled; then
+
+                    auto_sleep_status
+
+                    if confirm "Disable auto-sleep?"; then
+                        disable_auto_sleep
+                    fi
+
+                else
+
+                    configure_auto_sleep
+
+                fi
+
                 ;;
 
             0)
@@ -2099,6 +2533,11 @@ main_menu() {
 
                 echo -e "Jellyfin    ${GREEN}● ONLINE${RESET}"
 
+            elif docker inspect -f '{{.State.Paused}}' jellyfin 2>/dev/null |
+                 grep -qx "true"; then
+
+                echo -e "Jellyfin    ${YELLOW}◐ SLEEPING${RESET}"
+
             else
 
                 echo -e "Jellyfin    ${RED}● OFFLINE${RESET}"
@@ -2251,6 +2690,18 @@ case "${1:-}" in
 
     diagnose)
         diagnose_hardware_acceleration
+        ;;
+
+    autosleep)
+        configure_auto_sleep
+        ;;
+
+    autosleep-status)
+        auto_sleep_status
+        ;;
+
+    autosleep-disable)
+        disable_auto_sleep
         ;;
 
     *)
